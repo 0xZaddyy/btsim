@@ -266,8 +266,8 @@ define_entity!(
         confirmed_txs: Vec<TxId>,
     },
     {
-        // total size
-        // totel fees
+        // TODO total size
+        // TODO total fees
         height: usize,
         spent: OrdSet<Outpoint>,
         created: OrdSet<Outpoint>,
