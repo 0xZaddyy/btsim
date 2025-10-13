@@ -344,12 +344,6 @@ struct Input {
                         // witness?
 }
 
-impl Input {
-    fn weight(&self) -> Weight {
-        Weight::from_wu(4) // TODO remove
-    }
-}
-
 struct InputId {
     txid: TxId,
     index: usize,
