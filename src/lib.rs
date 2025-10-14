@@ -1246,8 +1246,24 @@ impl<'a> Simulation {
             .intersection(self.block_info.last().unwrap().all_confirmed_txs.clone())
             .is_empty());
 
-        // TODO for each wallet, ensure confirmed and unconfirmed utxos are disjoint
-        // TODO for each wallet, ensure own and received txs are disjoint
+        self.wallet_info.iter().for_each(|w| {
+            assert!(w
+                .confirmed_utxos
+                .clone()
+                .intersection(w.unconfirmed_txos.clone())
+                .is_empty());
+        });
+
+        self.wallet_info.iter().for_each(|w| {
+            assert!(
+                OrdSet::<TxId>::from_iter(w.broadcast_transactions.clone().into_iter())
+                    .intersection(OrdSet::from_iter(
+                        w.received_transactions.clone().into_iter()
+                    ))
+                    .is_empty()
+            );
+        });
+
         // TODO for all wallets, ensure their confirmed and unconfirmed utxos form a partition (their intersections are empty and their union is describes the corresponding block info and broadcast state)
         // take union and compare size to sum of sizes, and check equality with global structures
     }
@@ -1255,7 +1271,7 @@ impl<'a> Simulation {
 
 #[cfg(test)]
 mod tests {
-    use bdk_coin_select::FeeRate;
+    use bdk_coin_select::{TargetFee, TargetOutputs};
     use im::{ordset, vector};
 
     use super::*;
