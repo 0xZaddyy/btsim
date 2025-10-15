@@ -298,11 +298,6 @@ impl<'a> Simulation {
     }
 
     // TODO remove
-    fn get_block(&'a self, id: BlockId) -> BlockHandle<'a> {
-        id.with(&self)
-    }
-
-    // TODO remove
     fn get_tx(&'a self, id: TxId) -> TxHandle<'a> {
         id.with(&self)
     }
