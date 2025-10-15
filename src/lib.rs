@@ -113,7 +113,7 @@ enum CoinSelectionStrategy {
 // struct TxByFeerate(FeeRate, TxId);
 
 /// Wrapper type for timestep index
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Default)]
 pub(crate) struct Epoch(usize);
 
 #[derive(Debug)]
@@ -172,6 +172,7 @@ struct Simulation {
     broadcast_set_data: Vec<BroadcastSetData>,
     // TODO mempools, = orderings / replacements of broadcast_sets
     block_data: Vec<BlockData>,
+    current_epoch: Epoch,
 
     // secondary information (indexes)
     spends: OrdMap<Outpoint, OrdSet<TxId>>,
@@ -214,6 +215,8 @@ impl<'a> Simulation {
             unconfirmed_txs: OrdSet::default(),
             invalidated_txs: OrdSet::default(),
         });
+
+        sim.current_epoch = Epoch(0);
 
         sim
     }
@@ -301,6 +304,8 @@ impl<'a> Simulation {
             .id;
 
         from_wallet.broadcast(std::iter::once(spend));
+
+        self.current_epoch = Epoch(self.current_epoch.0 + 1);
     }
 
     fn genesis_block(&self) -> BlockId {
@@ -440,7 +445,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
+    fn test_universe() {
         let mut sim = SimulationBuilder::new(42, 2, 10, 1).build();
         sim.assert_invariants();
 
@@ -454,32 +459,144 @@ mod tests {
         sim.tick();
         sim.assert_invariants();
 
-        // TODO: tick creates the unconfirmed tx and then spends, these asserts have been commented out bc we cannot check the status of unconfirmed txs
-        // Until we have a mining entity
-        // assert_eq!(spend, TxId(3));
-
-        // assert_eq!(spend.with(&sim).info().weight, Weight::from_wu(688));
-
-        // assert_eq!(
-        //     alice.with(&sim).data().own_transactions,
-        //     vec![coinbase_tx, spend]
-        // );
-
-        // assert_eq!(
-        //     alice.with(&sim).info().broadcast_transactions,
-        //     Vector::default()
-        // );
-
-        // // these fields are not updated until broadcast
-        // assert_eq!(
-        //     alice.with(&sim).info().confirmed_utxos,
-        //     OrdSet::from_iter(coinbase_tx.with(&sim).outpoints())
-        // );
-        // assert_eq!(alice.with(&sim).info().unconfirmed_spends, ordset![]);
-
-        // alice.with_mut(&mut sim).broadcast(std::iter::once(spend));
-
         let spend = alice.with_mut(&mut sim).data().own_transactions[1];
+
+        assert_eq!(
+            alice.with(&sim).info().unconfirmed_spends,
+            OrdSet::from_iter(coinbase_tx.with(&sim).outpoints())
+        );
+
+        assert_eq!(
+            alice.with(&sim).info().unconfirmed_txos,
+            OrdSet::from_iter(spend.with(&sim).outpoints().skip(1))
+        );
+
+        assert_eq!(
+            bob.with(&sim).info().unconfirmed_txos,
+            OrdSet::from_iter(spend.with(&sim).outpoints().take(1))
+        );
+
+        assert_eq!(
+            alice.with(&sim).info().broadcast_transactions,
+            vector![spend]
+        );
+
+        assert!(bob.with(&sim).info().received_transactions.contains(&spend));
+
+        println!("{:?}", sim);
+    }
+
+    #[test]
+    fn it_works() {
+        let mut sim = Simulation::new();
+
+        sim.assert_invariants();
+
+        let alice = sim.new_wallet();
+        sim.assert_invariants();
+        let bob = sim.new_wallet();
+        sim.assert_invariants();
+
+        let alice_coinbase_addr = alice.with_mut(&mut sim).new_address();
+        sim.assert_invariants();
+
+        // TODO sim.current_broadcast_set()
+        let initial_bx = BroadcastSetHandleMut {
+            id: BroadcastSetId(0),
+            sim: &mut sim,
+        };
+
+        let coinbase_tx = initial_bx
+            .construct_block_template(Weight::MAX_BLOCK)
+            .mine(alice_coinbase_addr, &mut sim)
+            .coinbase_tx()
+            .id;
+
+        sim.assert_invariants();
+
+        assert_eq!(alice.with(&sim).data().own_transactions, vec![coinbase_tx]);
+        assert_eq!(
+            alice.with(&sim).info().confirmed_utxos,
+            OrdSet::from_iter(coinbase_tx.with(&sim).outpoints())
+        );
+
+        // TODO coinbase maturity
+
+        let payment = PaymentObligationData {
+            amount: Amount::from_int_btc(20),
+            from: WalletId(0),
+            to: WalletId(1),
+            deadline: Epoch(2), // TODO 102
+        };
+        sim.assert_invariants();
+
+        let bob_payment_addr = bob.with_mut(&mut sim).new_address();
+        sim.assert_invariants();
+        let alice_change_addr = alice.with_mut(&mut sim).new_address();
+        sim.assert_invariants();
+
+        let target = Target {
+            fee: TargetFee {
+                rate: bdk_coin_select::FeeRate::from_sat_per_vb(1.0),
+                replace: None,
+            },
+            outputs: TargetOutputs {
+                value_sum: payment.amount.to_sat(),
+                weight_sum: 34, // TODO use payment.to to derive an address, payment.into() ?
+                n_outputs: 1,
+            },
+        };
+
+        let long_term_feerate = bitcoin::FeeRate::from_sat_per_vb(10).unwrap();
+
+        let spend = alice
+            .with_mut(&mut sim)
+            .new_tx(|tx, sim| {
+                // TODO use select_coins
+                let (inputs, drain) = alice.with(&sim).select_coins(target, long_term_feerate);
+
+                tx.inputs = inputs
+                    .map(|o| Input {
+                        outpoint: o.outpoint,
+                    })
+                    .collect();
+
+                tx.outputs = vec![
+                    Output {
+                        amount: payment.amount,
+                        address_id: bob_payment_addr,
+                    },
+                    Output {
+                        amount: Amount::from_sat(drain.value),
+                        address_id: alice_change_addr,
+                    },
+                ];
+            })
+            .id;
+        sim.assert_invariants();
+
+        assert_eq!(spend, TxId(2));
+
+        assert_eq!(spend.with(&sim).info().weight, Weight::from_wu(688));
+
+        assert_eq!(
+            alice.with(&sim).data().own_transactions,
+            vec![coinbase_tx, spend]
+        );
+
+        assert_eq!(
+            alice.with(&sim).info().broadcast_transactions,
+            Vector::default()
+        );
+
+        // these fields are not updated until broadcast
+        assert_eq!(
+            alice.with(&sim).info().confirmed_utxos,
+            OrdSet::from_iter(coinbase_tx.with(&sim).outpoints())
+        );
+        assert_eq!(alice.with(&sim).info().unconfirmed_spends, ordset![]);
+
+        alice.with_mut(&mut sim).broadcast(std::iter::once(spend));
 
         assert_eq!(
             alice.with(&sim).info().unconfirmed_spends,
