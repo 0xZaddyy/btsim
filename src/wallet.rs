@@ -141,52 +141,57 @@ impl<'a> WalletHandleMut<'a> {
         id
     }
 
-    pub(crate) fn fufill_payment_obligation(&mut self) -> Option<TxId> {
-        let info = self.info();
-        let obligation = info.payment_obligations.iter().next();
-        if let Some(obligation) = obligation {
-            let obligation = obligation.with(self.sim).clone();
-            let to_addr = obligation.data().to;
-            let amount = obligation.data().amount.to_sat();
-            let target = Target {
-                fee: TargetFee {
-                    rate: bdk_coin_select::FeeRate::from_sat_per_vb(1.0),
-                    replace: None,
-                },
-                outputs: TargetOutputs {
-                    value_sum: amount,
-                    weight_sum: 34, // TODO use payment.to to derive an address, payment.into() ?
-                    n_outputs: 1,
-                },
-            };
-            let long_term_feerate = bitcoin::FeeRate::from_sat_per_vb(10).expect("valid fee rate");
+    pub(crate) fn fufill_payment_obligation(
+        &mut self,
+        payment_obligation: PaymentObligationId,
+    ) -> TxId {
+        // TODO: assert this is my obligation
+        let obligation = payment_obligation.with(self.sim).clone();
+        let to_addr = obligation.data().to;
+        let amount = obligation.data().amount.to_sat();
+        let target = Target {
+            fee: TargetFee {
+                rate: bdk_coin_select::FeeRate::from_sat_per_vb(1.0),
+                replace: None,
+            },
+            outputs: TargetOutputs {
+                value_sum: amount,
+                weight_sum: 34, // TODO use payment.to to derive an address, payment.into() ?
+                n_outputs: 1,
+            },
+        };
+        let long_term_feerate = bitcoin::FeeRate::from_sat_per_vb(10).expect("valid fee rate");
 
-            let (selected_coins, drain) = self.select_coins(target, long_term_feerate);
-            let change_addr = self.new_address();
-            let spend = self
-                .new_tx(|tx, _| {
-                    tx.inputs = selected_coins
-                        .map(|o| Input {
-                            outpoint: o.outpoint,
-                        })
-                        .collect();
+        let (selected_coins, drain) = self.select_coins(target, long_term_feerate);
+        let change_addr = self.new_address();
+        let spend = self
+            .new_tx(|tx, _| {
+                tx.inputs = selected_coins
+                    .map(|o| Input {
+                        outpoint: o.outpoint,
+                    })
+                    .collect();
 
-                    tx.outputs = vec![
-                        Output {
-                            amount: Amount::from_sat(amount),
-                            address_id: to_addr,
-                        },
-                        Output {
-                            amount: Amount::from_sat(drain.value),
-                            address_id: change_addr,
-                        },
-                    ];
-                })
-                .id;
+                tx.outputs = vec![
+                    Output {
+                        amount: Amount::from_sat(amount),
+                        address_id: to_addr,
+                    },
+                    Output {
+                        amount: Amount::from_sat(drain.value),
+                        address_id: change_addr,
+                    },
+                ];
+            })
+            .id;
 
-            return Some(spend);
-        }
-        None
+        // TODO: should this be done after broadcast / confirmation?
+        self.sim.payment_data.remove(payment_obligation.0);
+        self.sim.wallet_info[self.id.0]
+            .payment_obligations
+            .remove(&payment_obligation);
+        // TODO: remove from receiver's expected_payments
+        spend
     }
 
     pub(crate) fn new_tx<F>(&mut self, build: F) -> TxHandle

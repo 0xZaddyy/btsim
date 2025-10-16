@@ -263,31 +263,20 @@ impl<'a> Simulation {
             }
         }
 
-        self.new_payment_obligation();
         self.assert_invariants();
     }
 
     fn tick(&mut self) {
-        if self.payment_data.is_empty() {
-            println!("No payment obligations, skipping epoch");
-            self.current_epoch = Epoch(self.current_epoch.0 + 1);
-            // Lets create a random payment obligation
-            self.new_payment_obligation();
-            self.assert_invariants();
-            return;
-        }
-
         let payments = self.payment_data.clone();
-        for payment_obligation in payments.iter() {
+        for (i, payment_obligation) in payments.iter().enumerate() {
             let mut from_wallet = payment_obligation.from.with_mut(self);
-            let spend = from_wallet
-                .fufill_payment_obligation()
-                .expect("Payment obligation should have atleast one value");
+            let spend = from_wallet.fufill_payment_obligation(PaymentObligationId(i));
 
             from_wallet.broadcast(std::iter::once(spend));
         }
 
         if self.current_epoch.0 % self.block_interval == 0 {
+            println!("Mining block");
             let bx_id = BroadcastSetId(self.broadcast_set_data.len() - 1);
             let bx_set_handle = bx_id.with_mut(self);
             bx_set_handle
@@ -295,6 +284,7 @@ impl<'a> Simulation {
                 .mine(self.miner_address(), self);
         }
 
+        self.new_payment_obligation();
         self.current_epoch = Epoch(self.current_epoch.0 + 1);
         self.assert_invariants();
     }
@@ -337,7 +327,9 @@ impl<'a> Simulation {
             to = (to + 1) % max_wallets;
         }
         let amount = self.prng.gen_range(1..5);
-        let deadline = self.prng.gen_range(self.current_epoch.0..self.max_epochs.0);
+        let deadline = self
+            .prng
+            .gen_range(self.current_epoch.0 + 1..self.max_epochs.0);
         let to_addr = WalletId(to).with_mut(self).new_address();
         // First insert payment obligation into simulation
         self.payment_data.push(PaymentObligationData {
@@ -522,7 +514,7 @@ impl std::fmt::Display for Simulation {
             writeln!(f, "\nPayment {}:", i)?;
             writeln!(f, "  Amount: {}", payment.amount)?;
             writeln!(f, "  From: Wallet {}", payment.from.0)?;
-            writeln!(f, "  To: Wallet {}", payment.to.0)?;
+            writeln!(f, "  To: Address {}", payment.to.0)?;
             writeln!(f, "  Deadline: Epoch {}", payment.deadline.0)?;
         }
 
