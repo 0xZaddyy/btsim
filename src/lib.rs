@@ -203,6 +203,7 @@ impl SimulationBuilder {
             tx_info: Vec::new(),
             broadcast_set_info: Vec::new(),
             messages: Vec::new(),
+            last_processed_message: MessageId(0),
         };
         sim.max_epochs = Epoch(self.max_epochs);
         sim.prng = self.prng;
@@ -273,6 +274,7 @@ struct Simulation {
     block_info: Vec<BlockInfo>,
     tx_info: Vec<TxInfo>,
     broadcast_set_info: Vec<BroadcastSetInfo>,
+    last_processed_message: MessageId,
 }
 
 impl<'a> Simulation {
@@ -312,9 +314,10 @@ impl<'a> Simulation {
     }
 
     fn tick(&mut self) {
-        let messages = self.messages.clone();
+        let messages = self.messages[self.last_processed_message.0..].to_vec();
         // TODO: Right now we process every message everytime, should we have a cursor for the last message that was processes by the simulation?
         for message in messages.iter() {
+            self.last_processed_message = message.id;
             message.to.with_mut(self).handle_message(message.clone());
         }
 
