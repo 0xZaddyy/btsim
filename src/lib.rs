@@ -9,17 +9,19 @@ use crate::{
         BlockData, BlockHandle, BlockId, BlockInfo, BroadcastSetData, BroadcastSetHandleMut,
         BroadcastSetId, BroadcastSetInfo,
     },
+    cospend::{CospendData, CospendId},
     message::{MessageData, MessageId},
-    transaction::{Outpoint, TxData, TxHandle, TxId, TxInfo},
+    transaction::{Input, Outpoint, TxData, TxHandle, TxId, TxInfo},
     wallet::{
-        AddressData, AddressId, CollabroationSpend, PaymentObligationData, PaymentObligationId,
-        WalletData, WalletId, WalletInfo, WalletInfoId,
+        AddressData, AddressId, PaymentObligationData, PaymentObligationId, WalletData, WalletId,
+        WalletInfo, WalletInfoId,
     },
 };
 
 #[macro_use]
 mod macros;
 mod blocks;
+mod cospend;
 mod message;
 mod transaction;
 mod wallet;
@@ -203,6 +205,7 @@ impl SimulationBuilder {
             tx_info: Vec::new(),
             broadcast_set_info: Vec::new(),
             messages: Vec::new(),
+            cospends: Vec::new(),
             last_processed_message: MessageId(0),
         };
         sim.max_epochs = Epoch(self.max_epochs);
@@ -267,6 +270,7 @@ struct Simulation {
     peer_graph: PeerGraph,
     /// Append only vector of messages
     messages: Vec<MessageData>,
+    cospends: Vec<CospendData>,
 
     // secondary information (indexes)
     spends: OrdMap<Outpoint, OrdSet<TxId>>,
@@ -314,20 +318,10 @@ impl<'a> Simulation {
     }
 
     fn tick(&mut self) {
-        let messages = self.messages[self.last_processed_message.0..].to_vec();
-        // TODO: Right now we process every message everytime, should we have a cursor for the last message that was processes by the simulation?
-        for message in messages.iter() {
-            self.last_processed_message = message.id;
-            message.to.with_mut(self).handle_message(message.clone());
-        }
-
         let wallet_ids = self.wallet_data.iter().map(|w| w.id).collect::<Vec<_>>();
         // Skip the first wallet, which is the "miner"
         for wallet_id in wallet_ids.iter() {
-            if let Some(spend) = wallet_id.with_mut(self).handle_payment_obligations() {
-                println!("Broadcasting spend: {:?}", spend);
-                wallet_id.with_mut(self).broadcast(std::iter::once(spend));
-            }
+            wallet_id.with_mut(self).wake_up();
         }
 
         if self.current_epoch.0 % self.block_interval == 0 {
@@ -425,7 +419,6 @@ impl<'a> Simulation {
             unconfirmed_txos: OrdSet::<Outpoint>::default(),
             confirmed_utxos: OrdSet::<Outpoint>::default(),
             unconfirmed_spends: OrdSet::<Outpoint>::default(),
-            collabroation_spends: Vec::<CollabroationSpend>::default(),
         });
 
         let id = WalletId(self.wallet_data.len());
@@ -434,8 +427,9 @@ impl<'a> Simulation {
             last_wallet_info_id,
             addresses: Vec::default(),
             own_transactions: Vec::default(),
-            seen_messages: OrdSet::<MessageId>::default(),
+            last_processed_message: MessageId(0),
             handled_payment_obligations: OrdSet::<PaymentObligationId>::default(),
+            participating_cospends: OrdSet::<CospendId>::default(),
         });
         id
     }
@@ -580,39 +574,14 @@ impl std::fmt::Display for Simulation {
         for (i, message) in self.messages.iter().enumerate() {
             writeln!(
                 f,
-                "\nMessage {}: From: Wallet {}, To: Wallet {}, Message Type: {:?}",
-                i, message.from.0, message.to.0, message.message
+                "\nMessage {}: From: Wallet {}, To: Wallet {:?}, Message Type: {:?}",
+                i, message.from.0, message.to, message.message
             )?;
         }
 
-        let last_wallet_info_ids = self
-            .wallet_data
-            .iter()
-            .map(|w| (w.last_wallet_info_id.0))
-            .collect::<Vec<_>>();
-        let collabroation_spends = last_wallet_info_ids
-            .iter()
-            .map(|w| self.wallet_info[*w].collabroation_spends.clone())
-            .collect::<Vec<_>>();
-        for (i, collabroation_spend) in collabroation_spends.iter().enumerate() {
-            writeln!(f, "\nCollabroation Spend {}:", i)?;
-            for collabroation_spend in collabroation_spend.iter() {
-                writeln!(
-                    f,
-                    "  Payment Obligation ID: {:?}",
-                    collabroation_spend.payment_obligation_id
-                )?;
-                writeln!(
-                    f,
-                    "  Messages Sent: {:?}",
-                    collabroation_spend.messages_sent
-                )?;
-                writeln!(
-                    f,
-                    "  Messages Received: {:?}",
-                    collabroation_spend.messages_received
-                )?;
-            }
+        writeln!(f, "\nCospends: {}", self.cospends.len())?;
+        for (i, cospend) in self.cospends.iter().enumerate() {
+            writeln!(f, "Cospend {}: {:?}", i, cospend)?;
         }
 
         writeln!(f, "\nSpends: {}", self.spends.len())?;

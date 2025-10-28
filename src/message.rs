@@ -1,12 +1,34 @@
 use crate::{
+    cospend::CospendId,
     transaction::{Input, Output},
     wallet::WalletId,
+    Epoch,
 };
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct RegisterInput {
+    pub(crate) wallet_id: WalletId,
+    pub(crate) input: Input,
+    /// If None, the input is valid forever, otherwise it is valid until the epoch in the option
+    pub(crate) valid_till: Option<Epoch>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct InitiateCospend {
+    pub(crate) cospend_id: CospendId,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct RegisterOutputs {
+    pub(crate) cospend_id: CospendId,
+    pub(crate) outputs: Vec<Output>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum MessageType {
-    RegisterInputs(Vec<Input>),
-    RegisterOutputs(Vec<Output>),
+    RegisterInput(RegisterInput),
+    RegisterCospend(InitiateCospend),
+    RegisterOutputs(RegisterOutputs),
 }
 
 define_entity!(
@@ -15,8 +37,8 @@ define_entity!(
         pub(crate) id: MessageId,
         pub(crate) message: MessageType,
         pub(crate) from: WalletId,
-        pub(crate) to: WalletId,
-        pub(crate) previous_message: Option<MessageId>,
+        // None if meant as a broadcast message
+        pub(crate) to: Option<WalletId>,
     },
     {
     }

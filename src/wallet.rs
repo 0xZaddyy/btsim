@@ -1,6 +1,7 @@
 use crate::{
     blocks::{BroadcastSetHandleMut, BroadcastSetId},
-    message::{MessageData, MessageId, MessageType},
+    cospend::{CospendData, CospendId},
+    message::{InitiateCospend, MessageData, MessageId, MessageType, RegisterInput},
     Epoch, Simulation,
 };
 use bdk_coin_select::{
@@ -12,15 +13,6 @@ use im::{OrdSet, Vector};
 
 use crate::transaction::*;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub(crate) struct CollabroationSpend {
-    pub(crate) payment_obligation_id: PaymentObligationId,
-    pub(crate) messages_sent: Vec<MessageId>,
-    pub(crate) messages_received: Vec<MessageId>,
-    pub(crate) tx_template: TxData,
-    pub(crate) counter_party: WalletId,
-}
-
 define_entity_mut_updatable!(
     Wallet,
     {
@@ -28,8 +20,10 @@ define_entity_mut_updatable!(
         pub(crate) addresses: Vec<AddressId>,         // TODO split into internal/external?
         pub(crate) own_transactions: Vec<TxId>,       // transactions originating from this wallet
         pub(crate) last_wallet_info_id: WalletInfoId, // Monotone
-        pub(crate) seen_messages: OrdSet<MessageId>,
+        // Monotone index of the last message that was processed by this wallet
+        pub(crate) last_processed_message: MessageId,
         pub(crate) handled_payment_obligations: OrdSet<PaymentObligationId>,
+        pub(crate) participating_cospends: OrdSet<CospendId>,
     },
     {
         pub(crate) broadcast_set_id: BroadcastSetId,
@@ -41,7 +35,6 @@ define_entity_mut_updatable!(
         pub(crate) unconfirmed_transactions: OrdSet<TxId>,
         pub(crate) unconfirmed_txos: OrdSet<Outpoint>,  // compute CPFP cost
         pub(crate) unconfirmed_spends: OrdSet<Outpoint>, // RBFable
-        pub(crate) collabroation_spends: Vec<CollabroationSpend>,
     }
 );
 
@@ -145,6 +138,10 @@ impl<'a> WalletHandleMut<'a> {
         &mut self.sim.wallet_data[self.id.0]
     }
 
+    pub(crate) fn info_mut<'b>(&'b mut self) -> &'b mut WalletInfo {
+        &mut self.sim.wallet_info[self.id.0]
+    }
+
     pub(crate) fn new_address(&mut self) -> AddressId {
         let id = AddressId(self.sim.address_data.len());
         self.sim.wallet_data[self.id.0].addresses.push(id);
@@ -154,111 +151,53 @@ impl<'a> WalletHandleMut<'a> {
         id
     }
 
-    pub(crate) fn handle_message(&'a mut self, message: MessageData) {
-        if message.to == self.id {
-            if self.sim.wallet_data[self.id.0]
-                .seen_messages
-                .contains(&message.id)
-            {
-                return;
+    /// Returns the cospend ids that need to be processed
+    fn read_messages(&mut self) -> Vec<CospendId> {
+        let my_id = self.id;
+        let last_processed_message = self.data().last_processed_message;
+        let messages_to_process = self.sim.messages[last_processed_message.0..].to_vec();
+        if messages_to_process.is_empty() {
+            return Vec::new();
+        }
+
+        let mut cospend_ids_to_process = Vec::new();
+
+        for message in messages_to_process.iter() {
+            if message.from == my_id {
+                // Ignore messages from myself
+                continue;
             }
-            self.sim.wallet_data[self.id.0]
-                .seen_messages
-                .insert(message.id);
-
-            match message.message {
-                MessageType::RegisterInputs(_) => {
-                    let last_wallet_info_id = self.data().last_wallet_info_id;
-                    let last_wallet_info = &mut self.sim.wallet_info[last_wallet_info_id.0];
-                    // Check if our counter party is responding to our input registration
-                    if let Some(collabroation_spend) = last_wallet_info
-                        .collabroation_spends
-                        .iter_mut()
-                        .find(|c| c.counter_party == message.from)
-                    {
-                        // Add this message to the collabroation spend
-                        collabroation_spend.messages_received.push(message.id);
-                        // Register out outputs
-                        let message = MessageData {
-                            id: MessageId(self.sim.messages.len()),
-                            message: MessageType::RegisterOutputs(
-                                collabroation_spend.tx_template.outputs.clone(),
-                            ),
-                            from: self.id,
-                            to: message.from,
-                            previous_message: Some(message.id),
-                        };
-                        collabroation_spend.messages_sent.push(message.id);
-                        self.sim.broadcast_message(message.clone());
-                        return;
-                    }
-
-                    // TODO check that these are not my inputs
-
-                    // Handling payment obligations will register our inputs if we have a payment obligation that is not due
-                    // TODO: Employ some strategy to determine the best payment obligation to collaborate on
-                    self.handle_payment_obligations();
+            if message.to.is_none() {
+                // Ignore broadcast messages for now
+                continue;
+            }
+            if message.to.unwrap() != my_id {
+                // Ignore messages not for me
+                continue;
+            }
+            match &message.message {
+                MessageType::RegisterInput(register_input) => {
+                    unimplemented!()
                 }
-                MessageType::RegisterOutputs(_) => {
-                    let last_wallet_info_id = self.data().last_wallet_info_id;
-                    let last_wallet_info = &mut self.sim.wallet_info[last_wallet_info_id.0];
-                    // Check if our counter party is responding to our input registration
-                    if let Some(collabroation_spend) = last_wallet_info
-                        .collabroation_spends
-                        .iter_mut()
-                        .find(|c| c.counter_party == message.from)
-                    {
-                        // Add this message to the collabroation spend
-                        collabroation_spend.messages_received.push(message.id);
-                        // If we have received 2 messages and sent 2 then we can join everything together and broadcast the transaction
-                        if collabroation_spend.messages_sent.len() == 2
-                            && collabroation_spend.messages_received.len() == 2
-                        {
-                            let mut tx_template = collabroation_spend.tx_template.clone();
-                            for messages_received in collabroation_spend.messages_received.iter() {
-                                let message =
-                                    self.sim.messages[messages_received.0].message.clone();
-                                match message {
-                                    MessageType::RegisterOutputs(outs) => {
-                                        tx_template.outputs.extend(outs.iter());
-                                    }
-                                    MessageType::RegisterInputs(ins) => {
-                                        tx_template.inputs.extend(ins.iter());
-                                    }
-                                }
-                            }
-
-                            let txid = self.spend_tx(tx_template);
-                            self.broadcast(std::iter::once(txid));
-                            return;
-                        }
-
-                        // Ack the register outputs message by registering our outputs
-                        let message = MessageData {
-                            id: MessageId(self.sim.messages.len()),
-                            message: MessageType::RegisterOutputs(
-                                collabroation_spend.tx_template.outputs.clone(),
-                            ),
-                            from: self.id,
-                            to: message.from,
-                            previous_message: Some(message.id),
-                        };
-                        collabroation_spend.messages_sent.push(message.id);
-                        self.sim.broadcast_message(message.clone());
-                        return;
-                    }
+                MessageType::RegisterCospend(initiate_cospend) => {
+                    cospend_ids_to_process.push(initiate_cospend.cospend_id);
+                }
+                MessageType::RegisterOutputs(register_outputs) => {
+                    unimplemented!()
                 }
             }
         }
-        // TODO: else panic? something is wrong with the simulation?
+
+        self.data_mut().last_processed_message = messages_to_process.iter().last().unwrap().id;
+        cospend_ids_to_process
     }
 
     /// stateless utility function to construct a transaction for a given payment obligation
     fn construct_payment_transaction(
         &self,
-        obligation: PaymentObligationData,
-        change_addr: AddressId,
-        to_address: AddressId,
+        obligation: &PaymentObligationData,
+        change_addr: &AddressId,
+        to_address: &AddressId,
     ) -> TxData {
         let amount = obligation.amount.to_sat();
         let target = Target {
@@ -284,11 +223,11 @@ impl<'a> WalletHandleMut<'a> {
         tx.outputs = vec![
             Output {
                 amount: Amount::from_sat(amount),
-                address_id: to_address,
+                address_id: *to_address,
             },
             Output {
                 amount: Amount::from_sat(drain.value),
-                address_id: change_addr,
+                address_id: *change_addr,
             },
         ];
         tx
@@ -301,62 +240,115 @@ impl<'a> WalletHandleMut<'a> {
             .difference(self.data().handled_payment_obligations.clone())
     }
 
-    pub(crate) fn handle_payment_obligations(&mut self) -> Option<TxId> {
-        let payment_obligations = self.effective_payment_obligations();
+    fn next_payment_obligation(&'a self) -> Option<PaymentObligationId> {
+        self.effective_payment_obligations().iter().next().cloned()
+    }
 
-        if payment_obligations.is_empty() {
+    fn participate_in_cospend(&mut self, cospend: &CospendId) -> Option<TxId> {
+        // If im already participating in this cospend, no need to respond to registration message
+        if self.data().participating_cospends.contains(&cospend) {
             return None;
         }
-        let payment_obligation_id = payment_obligations
-            .iter()
-            .next()
-            .expect("payment obligations should not be empty");
-        let payment_obligation = payment_obligation_id.with(self.sim).data().clone();
+        // TODO Check the cospend validity
+        let cospend = cospend.with(self.sim).data().clone();
+        // if we have a payment obligation then lets batch it with this cospend
+        let payment_obligation_id = self.next_payment_obligation();
+        if let Some(payment_obligation_id) = payment_obligation_id {
+            let payment_obligation = payment_obligation_id.with(self.sim).data().clone();
+            let change_addr = self.new_address();
+            let to_address = payment_obligation.to.with_mut(self.sim).new_address();
+            let mut tx_template =
+                self.construct_payment_transaction(&payment_obligation, &change_addr, &to_address);
+            tx_template.inputs.extend(cospend.inputs.iter().cloned());
+            tx_template.outputs.extend(cospend.outputs.iter().cloned());
+
+            let tx_id = self.spend_tx(tx_template);
+            // TODO: if this was a failure, we should not mark the payment obligation as handled
+            // Moreover this should be handled when we are updating wallet states for all wallets after confirmation
+            self.data_mut()
+                .handled_payment_obligations
+                .insert(payment_obligation_id);
+            Some(tx_id)
+        } else {
+            None
+        }
+    }
+
+    fn create_cospend(&mut self, payment_obligation: &PaymentObligationData) -> CospendData {
+        let cospend_id = CospendId(self.sim.cospends.len());
+        let change_addr = self.new_address();
+        let to_address = payment_obligation.to.with_mut(self.sim).new_address();
+        let tx_template =
+            self.construct_payment_transaction(payment_obligation, &change_addr, &to_address);
+        let cospend = CospendData {
+            id: cospend_id,
+            inputs: tx_template.inputs.clone(),
+            outputs: tx_template.outputs.clone(),
+            valid_till: payment_obligation.deadline,
+        };
+        cospend
+    }
+
+    pub(crate) fn wake_up(&'a mut self) {
+        let cospend_ids_to_process = self.read_messages();
+        let mut txs_to_broadcast = Vec::new();
+        for cospend_id in cospend_ids_to_process {
+            if let Some(tx_id) = self.participate_in_cospend(&cospend_id) {
+                txs_to_broadcast.push(tx_id);
+            }
+        }
+
+        // If I have any payment obligations I should try to spend them if they are due soon
+        // Other wise I should register my inputs and look for others to collaborate with
+
+        if let Some(payment_obligation_id) = self.next_payment_obligation() {
+            let current_epoch = self.sim.current_epoch;
+            let payment_obligation = payment_obligation_id.with(self.sim).data().clone();
+
+            let time_left = payment_obligation.deadline.0 as i32 - current_epoch.0 as i32;
+            // TODO: this should be configurable
+            // Right now the wallets are patient for the most part
+            if time_left <= 2 {
+                txs_to_broadcast.push(self.handle_payment_obligations(&payment_obligation));
+                // TODO: if we are handling a payment obligation, we should not register inputs. This doesn't have to be the case but doing this for now bc its easier to debug
+                return;
+            }
+
+            // If its not due soon lets batch the payment
+            let cospend = self.create_cospend(&payment_obligation);
+            let message_id = MessageId(self.sim.messages.len());
+            let message = MessageData {
+                id: message_id,
+                from: self.id,
+                to: Some(payment_obligation.to),
+                message: MessageType::RegisterCospend(InitiateCospend {
+                    cospend_id: cospend.id,
+                }),
+            };
+            self.data_mut().participating_cospends.insert(cospend.id);
+            self.sim.broadcast_message(message.clone());
+            self.sim.cospends.push(cospend);
+
+            self.broadcast(txs_to_broadcast);
+        }
+    }
+
+    fn handle_payment_obligations(
+        &'a mut self,
+        payment_obligation: &PaymentObligationData,
+    ) -> TxId {
+        let payment_obligation_id = payment_obligation.id;
         let change_addr = self.new_address();
         let to_wallet = payment_obligation.to;
         let to_address = to_wallet.with_mut(self.sim).new_address();
         let tx_template =
-            self.construct_payment_transaction(payment_obligation.clone(), change_addr, to_address);
+            self.construct_payment_transaction(payment_obligation, &change_addr, &to_address);
 
-        let time_left = payment_obligation.deadline.0 as i32 - self.sim.current_epoch.0 as i32;
-        // TODO: this should be configurable. Right now the wallets are very impatient
-        if time_left <= 2 {
-            let tx_id = self.spend_tx(tx_template);
-            self.data_mut()
-                .handled_payment_obligations
-                .insert(*payment_obligation_id);
-            return Some(tx_id);
-        }
-        // Try to register our inputs if we already have not
-        let last_wallet_info_id = self.data().last_wallet_info_id;
-        let mut last_wallet_info = self.sim.wallet_info[last_wallet_info_id.0].clone();
-        // TODO: refactor to use a map?
-        // TODO: currently we are only collaborating once per sim run
-        if last_wallet_info.collabroation_spends.is_empty() {
-            // For now lets reach out to recepient to batch this payment
-            // Later we can reach out to the entire peer graph to form a coalition
-            let message = MessageData {
-                id: MessageId(self.sim.messages.len()),
-                message: MessageType::RegisterInputs(tx_template.inputs.clone()),
-                from: self.id,
-                to: to_wallet,
-                previous_message: None,
-            };
-            self.sim.broadcast_message(message.clone());
-            let collabroation_spend = CollabroationSpend {
-                payment_obligation_id: *payment_obligation_id,
-                messages_sent: vec![message.id],
-                messages_received: vec![],
-                counter_party: to_wallet,
-                tx_template: tx_template.clone(),
-            };
-            last_wallet_info
-                .collabroation_spends
-                .push(collabroation_spend);
-            self.sim.wallet_info[last_wallet_info_id.0] = last_wallet_info;
-        }
-
-        None
+        let tx_id = self.spend_tx(tx_template);
+        self.data_mut()
+            .handled_payment_obligations
+            .insert(payment_obligation_id);
+        tx_id
     }
 
     // TODO: refactor this? Do we event need this?
