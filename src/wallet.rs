@@ -233,15 +233,16 @@ impl<'a> WalletHandleMut<'a> {
         tx
     }
 
-    fn effective_payment_obligations(&self) -> OrdSet<PaymentObligationId> {
+    /// Returns the next payment obligation that is not handled
+    /// TODO: this should be a priority queue
+    fn next_payment_obligation(&'a self) -> Option<PaymentObligationId> {
         self.info()
             .payment_obligations
             .clone()
             .difference(self.data().handled_payment_obligations.clone())
-    }
-
-    fn next_payment_obligation(&'a self) -> Option<PaymentObligationId> {
-        self.effective_payment_obligations().iter().next().cloned()
+            .iter()
+            .next()
+            .cloned()
     }
 
     fn participate_in_cospend(&mut self, cospend: &CospendId) -> Option<TxId> {
