@@ -134,16 +134,6 @@ enum CoinSelectionStrategy {
 // TODO: use WalletId instead of usize?
 struct PeerGraph(UnGraph<usize, ()>);
 
-impl PartialEq for PeerGraph {
-    fn eq(&self, other: &Self) -> bool {
-        todo!()
-        // self.0.node_count() == other.0.node_count()
-        //     && self.0.edge_count() == other.0.edge_count()
-    }
-}
-
-impl Eq for PeerGraph {}
-
 /// Wrapper type for timestep index
 // TODO: rename to Timestep
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Default)]
