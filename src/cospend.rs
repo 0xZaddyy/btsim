@@ -1,14 +1,10 @@
-use crate::{
-    transaction::{Input, Output},
-    TimeStep,
-};
+use crate::{transaction::TxData, TimeStep};
 
 define_entity!(
     Cospend,
     {
         pub(crate) id: CospendId,
-        pub(crate) inputs: Vec<Input>,
-        pub(crate) outputs: Vec<Output>,
+        pub(crate) tx: TxData,
         pub(crate) valid_till: TimeStep,
         // TODO: acceptable fee rate
         // TODO: other transaction properties (nsequence, nlocktime)

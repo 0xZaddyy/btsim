@@ -26,8 +26,9 @@ pub(crate) struct RegisterOutputs {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum MessageType {
-    RegisterInput(RegisterInput),
+    /// Initiate a cospend with the receiver of payment
     RegisterCospend(InitiateCospend),
+    RegisterInput(RegisterInput),
     RegisterOutputs(RegisterOutputs),
 }
 

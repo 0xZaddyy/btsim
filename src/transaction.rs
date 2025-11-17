@@ -1,4 +1,4 @@
-use crate::wallet::{AddressHandle, AddressId, WalletHandle, WalletHandleMut};
+use crate::wallet::{AddressHandle, AddressId, WalletHandle, WalletHandleMut, WalletId};
 use crate::Simulation;
 use bitcoin::consensus::Decodable;
 use bitcoin::transaction::{predict_weight, InputWeightPrediction};
@@ -11,6 +11,8 @@ define_entity!(
         // version, locktime, witness flag
         pub(crate) inputs: Vec<Input>,
         pub(crate) outputs: Vec<Output>,
+        /// Wallets that have approved this transaction
+        pub(crate) wallet_acks: Vec<WalletId>,
     },
     {
         pub(crate) fee: Amount,
@@ -255,6 +257,26 @@ impl<'a> TxHandle<'a> {
             .any(|block| block.confirmed_txs.contains(&self.id))
     }
 
+    /// Returns true if all wallets that have inputs in this transaction have acknowledged it
+    /// One ack from output owner is enough for all their UTXOs
+    pub(crate) fn is_acked(&self) -> bool {
+        for input in self.data().inputs.iter() {
+            if !self
+                .data()
+                .wallet_acks
+                .contains(&input.outpoint.with(&self.sim).wallet().data().id)
+            {
+                println!(
+                    "Input {:?} is not acked",
+                    input.outpoint.with(&self.sim).wallet().data().id
+                );
+                return false;
+            }
+        }
+
+        true
+    }
+
     // TODO fn prevouts(self) -> impl IntoIterator??
     // TODO previous txs
 }
@@ -264,6 +286,7 @@ impl Default for TxData {
         Self {
             inputs: Vec::default(),
             outputs: Vec::default(),
+            wallet_acks: Vec::default(),
         }
     }
 }

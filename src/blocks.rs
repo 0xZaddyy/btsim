@@ -2,7 +2,6 @@ use bitcoin::{Amount, Weight};
 use im::OrdSet;
 
 use crate::{
-    cospend::CospendId,
     define_entity,
     transaction::{Outpoint, Output, TxHandle, TxId},
     wallet::{AddressId, WalletHandle, WalletId, WalletInfo, WalletInfoId},
@@ -92,14 +91,20 @@ impl<'a> BroadcastSetHandleMut<'a> {
         for tx in block.data().txs() {
             unconfirmed_txs.remove(&tx);
 
+            let tx = tx.with(self.sim);
+            if !tx.is_acked() {
+                // This may change if we want to model deviations
+                panic!("Currently no one should be deviating from the protocol");
+            }
+
             // also remove conflicting transactions
             // TODO refactor tx.with(self.sim).spent_coins() impl Iterator Outppoint?
-            for input in &tx.with(self.sim).data().inputs {
-                let spends = self.sim.spends[&input.outpoint]
+            for input in tx.inputs() {
+                let spends = self.sim.spends[&input.data().outpoint]
                     .iter()
                     .map(|input_id| input_id.txid)
                     .collect::<OrdSet<TxId>>();
-                for conflicting_tx in spends.without(&tx).intersection(unconfirmed_txs.clone())
+                for conflicting_tx in spends.without(&tx.id).intersection(unconfirmed_txs.clone())
                 // FIXME pr to im, unnecessary clone
                 {
                     unconfirmed_txs.remove(&conflicting_tx);

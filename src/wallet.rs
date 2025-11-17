@@ -302,8 +302,16 @@ impl<'a> WalletHandleMut<'a> {
                     .unconfirmed_txos_in_cospends
                     .insert(input.outpoint, cospend.id);
             }
-            tx_template.inputs.extend(cospend.inputs.iter().cloned());
-            tx_template.outputs.extend(cospend.outputs.iter().cloned());
+            self.ack_transaction(&mut tx_template);
+            tx_template.inputs.extend(cospend.tx.inputs.iter().cloned());
+            tx_template
+                .outputs
+                .extend(cospend.tx.outputs.iter().cloned());
+            tx_template
+                .wallet_acks
+                .extend(cospend.tx.wallet_acks.iter().cloned());
+
+            debug_assert!(tx_template.wallet_acks.contains(&self.id));
 
             let tx_id = self.spend_tx(tx_template);
             self.data_mut().participating_cospends.insert(cospend.id);
@@ -324,16 +332,17 @@ impl<'a> WalletHandleMut<'a> {
         let cospend_id = CospendId(self.sim.cospends.len());
         let change_addr = self.new_address();
         let to_address = payment_obligation.to.with_mut(self.sim).new_address();
-        let tx_template =
+        let mut tx_template =
             self.construct_transaction_template(payment_obligation, &change_addr, &to_address);
+        self.ack_transaction(&mut tx_template);
+        debug_assert!(tx_template.wallet_acks.contains(&self.id));
         let cospend = CospendData {
             id: cospend_id,
-            inputs: tx_template.inputs.clone(),
-            outputs: tx_template.outputs.clone(),
+            tx: tx_template,
             valid_till: payment_obligation.deadline,
         };
         self.data_mut().participating_cospends.insert(cospend_id);
-        for input in cospend.inputs.iter() {
+        for input in cospend.tx.inputs.iter() {
             self.info_mut()
                 .unconfirmed_txos_in_cospends
                 .insert(input.outpoint, cospend_id);
@@ -358,7 +367,6 @@ impl<'a> WalletHandleMut<'a> {
 
         // If I have any payment obligations I should try to spend them if they are due soon
         // Other wise I should register my inputs and look for others to collaborate with
-
         if let Some(payment_obligation_id) = self.next_payment_obligation() {
             let payment_obligation = payment_obligation_id.with(self.sim).data().clone();
 
@@ -368,7 +376,6 @@ impl<'a> WalletHandleMut<'a> {
                 <= self.sim.config.payment_obligation_deadline_threshold
             {
                 self.handle_payment_obligations(&payment_obligation);
-                // TODO: if we are handling a payment obligation, we should not register inputs. This doesn't have to be the case but doing this for now bc its easier to debug
                 return;
             }
 
@@ -397,8 +404,9 @@ impl<'a> WalletHandleMut<'a> {
         let change_addr = self.new_address();
         let to_wallet = payment_obligation.to;
         let to_address = to_wallet.with_mut(self.sim).new_address();
-        let tx_template =
+        let mut tx_template =
             self.construct_transaction_template(payment_obligation, &change_addr, &to_address);
+        self.ack_transaction(&mut tx_template);
 
         let tx_id = self.spend_tx(tx_template);
         self.info_mut()
@@ -408,6 +416,10 @@ impl<'a> WalletHandleMut<'a> {
         tx_id
     }
 
+    fn ack_transaction(&self, tx: &mut TxData) {
+        tx.wallet_acks.push(self.id);
+    }
+
     // TODO: refactor this? Do we event need this?
     fn spend_tx(&mut self, txdata: TxData) -> TxId {
         // TODO: assert this is my obligation
@@ -415,6 +427,7 @@ impl<'a> WalletHandleMut<'a> {
             .new_tx(|tx, _| {
                 tx.inputs = txdata.inputs;
                 tx.outputs = txdata.outputs;
+                tx.wallet_acks = txdata.wallet_acks;
             })
             .id;
 
