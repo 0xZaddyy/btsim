@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     blocks::{BroadcastSetHandleMut, BroadcastSetId},
-    message::{CoSpendProposal, MessageData, MessageId, MessageType},
+    message::{MessageData, MessageId, MessageType, PayjoinProposal},
     Simulation, TimeStep,
 };
 use bdk_coin_select::{
@@ -168,7 +168,7 @@ impl<'a> WalletHandleMut<'a> {
     }
 
     /// Returns the cospend ids that need to be processed
-    fn read_messages(&mut self) -> Vec<(MessageId, CoSpendProposal)> {
+    fn read_messages(&mut self) -> Vec<(MessageId, PayjoinProposal)> {
         let my_id = self.id;
         let last_processed_message = self.data().last_processed_message;
         let messages_to_process = self.sim.messages[last_processed_message.0..].to_vec();
@@ -278,7 +278,7 @@ impl<'a> WalletHandleMut<'a> {
     fn participate_in_cospend(
         &mut self,
         message_id: MessageId,
-        cospend: &CoSpendProposal,
+        cospend: &PayjoinProposal,
     ) -> Option<TxId> {
         if cospend.valid_till < self.sim.current_timestep {
             return None;
@@ -327,14 +327,14 @@ impl<'a> WalletHandleMut<'a> {
         &mut self,
         message_id: MessageId,
         payment_obligation: &PaymentObligationData,
-    ) -> CoSpendProposal {
+    ) -> PayjoinProposal {
         let change_addr = self.new_address();
         let to_address = payment_obligation.to.with_mut(self.sim).new_address();
         let mut tx_template =
             self.construct_transaction_template(payment_obligation, &change_addr, &to_address);
         self.ack_transaction(&mut tx_template);
         debug_assert!(tx_template.wallet_acks.contains(&self.id));
-        let cospend = CoSpendProposal {
+        let cospend = PayjoinProposal {
             tx: tx_template,
             valid_till: payment_obligation.deadline,
         };

@@ -1,7 +1,7 @@
 use crate::{transaction::TxData, wallet::WalletId, TimeStep};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub(crate) struct CoSpendProposal {
+pub(crate) struct PayjoinProposal {
     pub(crate) tx: TxData,
     pub(crate) valid_till: TimeStep,
 }
@@ -9,7 +9,7 @@ pub(crate) struct CoSpendProposal {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum MessageType {
     /// Initiate a cospend with the receiver of payment
-    RegisterCospend(CoSpendProposal),
+    RegisterCospend(PayjoinProposal),
 }
 
 define_entity!(

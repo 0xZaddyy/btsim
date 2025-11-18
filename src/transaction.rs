@@ -241,10 +241,6 @@ impl<'a> TxHandle<'a> {
                 .wallet_acks
                 .contains(&input.outpoint.with(&self.sim).wallet().data().id)
             {
-                println!(
-                    "Input {:?} is not acked",
-                    input.outpoint.with(&self.sim).wallet().data().id
-                );
                 return false;
             }
         }

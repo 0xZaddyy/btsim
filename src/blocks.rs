@@ -92,11 +92,6 @@ impl<'a> BroadcastSetHandleMut<'a> {
             unconfirmed_txs.remove(&tx);
 
             let tx = tx.with(self.sim);
-            if !tx.is_acked() {
-                // This may change if we want to model deviations
-                panic!("Currently no one should be deviating from the protocol");
-            }
-
             // also remove conflicting transactions
             // TODO refactor tx.with(self.sim).spent_coins() impl Iterator Outppoint?
             for input in tx.inputs() {
