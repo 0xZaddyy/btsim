@@ -465,7 +465,7 @@ impl<'a> Simulation {
             last_wallet_info_id,
             addresses: Vec::default(),
             own_transactions: Vec::default(),
-            last_processed_message: MessageId(0),
+            messages_processed: OrdSet::<MessageId>::default(),
         });
         id
     }

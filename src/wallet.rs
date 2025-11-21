@@ -23,7 +23,7 @@ define_entity_mut_updatable!(
         pub(crate) own_transactions: Vec<TxId>,       // transactions originating from this wallet
         pub(crate) last_wallet_info_id: WalletInfoId, // Monotone
         // Monotone index of the last message that was processed by this wallet
-        pub(crate) last_processed_message: MessageId,
+        pub(crate) messages_processed: OrdSet<MessageId>,
     },
     {
         pub(crate) broadcast_set_id: BroadcastSetId,
@@ -172,8 +172,13 @@ impl<'a> WalletHandleMut<'a> {
     /// Returns the payjoin proposal ids that need to be processed
     fn read_messages(&mut self) -> Vec<(MessageId, PayjoinProposal)> {
         let my_id = self.id;
-        let last_processed_message = self.data().last_processed_message;
-        let messages_to_process = self.sim.messages[last_processed_message.0..].to_vec();
+        let messages_to_process = self
+            .sim
+            .messages
+            .iter()
+            .filter(|message| !self.data().messages_processed.contains(&message.id))
+            .cloned()
+            .collect::<Vec<_>>();
         if messages_to_process.is_empty() {
             return Vec::new();
         }
@@ -201,8 +206,9 @@ impl<'a> WalletHandleMut<'a> {
         }
 
         // Plus one to avoid processing the same message twice
-        self.data_mut().last_processed_message =
-            MessageId(messages_to_process.last().unwrap().id.0 + 1);
+        self.data_mut()
+            .messages_processed
+            .extend(messages_to_process.iter().map(|message| message.id));
         payjoin_ids_to_process
     }
 
@@ -350,7 +356,13 @@ impl<'a> WalletHandleMut<'a> {
 
     fn enumerate_actions(&self) -> WalletPotentialActions {
         let mut payjoins = Vec::new();
-        let messages = self.sim.messages[self.data().last_processed_message.0..].to_vec();
+        let messages = self
+            .sim
+            .messages
+            .iter()
+            .filter(|message| !self.data().messages_processed.contains(&message.id))
+            .cloned()
+            .collect::<Vec<_>>();
         for message in messages.iter() {
             match &message.message {
                 MessageType::InitiatePayjoin(payjoin_proposal) => {
