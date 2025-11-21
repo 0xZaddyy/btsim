@@ -23,6 +23,7 @@ use crate::{
 
 #[macro_use]
 mod macros;
+mod actions;
 mod blocks;
 mod economic_graph;
 mod graphviz;
