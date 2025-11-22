@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    actions::{Action, Strategy, UnilateralSpender, WalletPotentialActions},
+    actions::{Action, Strategy, UnilateralSpender, WalletView},
     blocks::{BroadcastSetHandleMut, BroadcastSetId},
     message::{MessageId, MessageType, PayjoinProposal},
     Simulation, TimeStep,
@@ -55,6 +55,15 @@ impl<'a> WalletHandle<'a> {
 
     pub(crate) fn info(&self) -> &'a WalletInfo {
         &self.sim.wallet_info[self.data().last_wallet_info_id.0]
+    }
+
+    // TODO: this should take into account liabilties spending unconfirmed UTXOs. For which a CPFP cost model is needed
+    // In the future in needs to take as arg the current mempool and somethign to predict the state of the mempool overtime
+    pub(crate) fn effective_balance(&self) -> Amount {
+        let utxos: Vec<OutputHandle<'a>> = self.unspent_coins().collect();
+        let outputs_amounts = utxos.iter().map(|output| output.data().amount).sum();
+
+        outputs_amounts
     }
 
     // TODO give utxo list as argument so that different variants can be used
@@ -137,10 +146,10 @@ impl<'a> WalletHandle<'a> {
             !self.info().unconfirmed_spends.contains(&o.outpoint())
             // TODO Startegies should inform which inputs can be spendable.
             // TODO: these inputs should unlock if the payjoin is expired or the associated payment obligation is due soon (i.e payment anxiety)
-                && !self
-                    .info()
-                    .unconfirmed_txos_in_payjoins
-                    .contains_key(&o.outpoint())
+            // && !self
+            //     .info()
+            //     .unconfirmed_txos_in_payjoins
+            //     .contains_key(&o.outpoint())
         })
     }
 
@@ -158,6 +167,13 @@ impl<'a> WalletHandleMut<'a> {
     fn info_mut<'b>(&'b mut self) -> &'b mut WalletInfo {
         let last_wallet_info_id = self.data().last_wallet_info_id;
         &mut self.sim.wallet_info[last_wallet_info_id.0]
+    }
+
+    pub(crate) fn handle(&self) -> WalletHandle {
+        WalletHandle {
+            sim: self.sim,
+            id: self.data().id,
+        }
     }
 
     pub(crate) fn new_address(&mut self) -> AddressId {
@@ -354,7 +370,7 @@ impl<'a> WalletHandleMut<'a> {
         payjoin_proposal
     }
 
-    fn enumerate_actions(&self) -> WalletPotentialActions {
+    pub(crate) fn wallet_view(&self) -> WalletView {
         let mut payjoins = Vec::new();
         let messages = self
             .sim
@@ -378,22 +394,24 @@ impl<'a> WalletHandleMut<'a> {
             .iter()
             .map(|po| po.with(self.sim).data().clone())
             .collect::<Vec<_>>();
-        WalletPotentialActions::new(payment_obligations, payjoins)
+        WalletView::new(payment_obligations, self.sim.current_timestep)
     }
 
-    fn do_action(&'a mut self, action: &Action) {
+    pub(crate) fn do_action(&'a mut self, action: &Action) {
         match action {
             Action::UnilateralSpend(po) => {
                 let _ = self.handle_payment_obligation(po);
             }
-            Action::DoNothing => {}
+            Action::Wait => {}
             _ => unimplemented!(),
         }
     }
 
     pub(crate) fn wake_up(&'a mut self) {
-        let strat = UnilateralSpender;
-        let action = strat.do_something(&self.enumerate_actions(), &self.sim);
+        let strat = UnilateralSpender {
+            payment_obligation_utility_factor: 0.01,
+        };
+        let action = strat.do_something(self);
         self.do_action(&action);
 
         // TODO: bring all the payjoin logic back as a strategy
