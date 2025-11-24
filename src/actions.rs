@@ -114,7 +114,6 @@ fn simulate_one_action(wallet_handle: &WalletHandleMut, action: &Action) -> Vec<
 /// TODO: Strategies should be composible. They should enform the action decision space scoring and doing actions should be handling by something else that has composed multiple strategies.
 pub(crate) trait Strategy {
     fn enumerate_candidate_actions(&self, state: &WalletView) -> impl Iterator<Item = Action>;
-    fn do_something(&self, state: &WalletHandleMut) -> Action;
     fn score_action(&self, action: &Action, wallet_handle: &WalletHandleMut) -> ActionScore;
 }
 
@@ -161,15 +160,6 @@ impl Strategy for UnilateralSpender {
 
         actions.into_iter()
     }
-
-    fn do_something(&self, state: &WalletHandleMut) -> Action {
-        let wallet_view = state.wallet_view();
-        // Unilateral spender ignores any payjoin or cospend oppurtunities
-        self.enumerate_candidate_actions(&wallet_view)
-            .min_by_key(|action| self.score_action(action, state))
-            .unwrap_or(Action::Wait)
-    }
-
     fn score_action(&self, action: &Action, wallet_handle: &WalletHandleMut) -> ActionScore {
         let events = simulate_one_action(wallet_handle, action);
         let mut score = ActionScore(0.0);

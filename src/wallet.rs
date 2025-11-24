@@ -408,10 +408,14 @@ impl<'a> WalletHandleMut<'a> {
     }
 
     pub(crate) fn wake_up(&'a mut self) {
-        let strat = UnilateralSpender {
+        let strategy = UnilateralSpender {
             payment_obligation_utility_factor: 0.01,
         };
-        let action = strat.do_something(self);
+        let wallet_view = self.wallet_view();
+        let action = strategy
+            .enumerate_candidate_actions(&wallet_view)
+            .min_by_key(|action| strategy.score_action(action, self))
+            .unwrap_or(Action::Wait);
         self.do_action(&action);
 
         // TODO: bring all the payjoin logic back as a strategy
