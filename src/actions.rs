@@ -32,11 +32,12 @@ pub(crate) struct PaymentObligationHandledEvent {
 
 impl PaymentObligationHandledEvent {
     fn score(&self, payment_obligation_utility_factor: f64) -> ActionScore {
-        // TODO: Utility should be higher for earlier deadlines.
+        let deadline_anxiety = self.time_left.pow(3) as f64 / 50.0;
         ActionScore(
             self.balance_difference
                 .to_float_in(bitcoin::Denomination::Satoshi)
                 - (payment_obligation_utility_factor
+                    * deadline_anxiety
                     * self
                         .amount_handled
                         .to_float_in(bitcoin::Denomination::Satoshi)),
@@ -107,14 +108,6 @@ fn simulate_one_action(wallet_handle: &WalletHandleMut, action: &Action) -> Vec<
     }
 
     events
-}
-
-/// Model payment obligation deadline anxiety as a cubic function of the time left.
-/// The goal is to make the wallets more anxious as the deadline approaches and expires.
-fn deadline_anxiety(deadline: i32, current_time: i32) -> f64 {
-    // delta^3 / 50
-    let time_left = deadline - current_time;
-    (time_left.pow(3) as f64) / 50.0
 }
 
 /// Strategies will pick one action to minimize their cost
