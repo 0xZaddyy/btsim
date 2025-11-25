@@ -394,7 +394,7 @@ impl<'a> WalletHandleMut<'a> {
             .iter()
             .map(|po| po.with(self.sim).data().clone())
             .collect::<Vec<_>>();
-        WalletView::new(payment_obligations, self.sim.current_timestep)
+        WalletView::new(payment_obligations, messages, self.sim.current_timestep)
     }
 
     pub(crate) fn do_action(&'a mut self, action: &Action) {

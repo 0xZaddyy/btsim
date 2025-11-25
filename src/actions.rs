@@ -3,7 +3,7 @@ use std::{iter::Sum, ops::Add};
 use bitcoin::Amount;
 
 use crate::{
-    message::PayjoinProposal,
+    message::{MessageData, MessageType, PayjoinProposal},
     wallet::{PaymentObligationData, PaymentObligationId, WalletHandleMut},
     TimeStep,
 };
@@ -19,6 +19,7 @@ pub(crate) enum Action {
 /// Hypothetical outcomes of an action
 pub(crate) enum Event {
     PaymentObligationHandled(PaymentObligationHandledEvent),
+    InitiatePayjoin(InitiatePayjoinEvent),
 }
 
 pub(crate) struct PaymentObligationHandledEvent {
@@ -45,6 +46,36 @@ impl PaymentObligationHandledEvent {
     }
 }
 
+pub(crate) struct InitiatePayjoinEvent {
+    /// Time left on the payment obligation
+    time_left: i32,
+    /// Amount of the payment obligation
+    amount_handled: Amount,
+    /// Balance difference after the action
+    balance_difference: Amount,
+    /// Fee savings from the payjoin
+    fee_savings: Amount,
+    // TODO: somekind of privacy gained metric?
+}
+
+impl InitiatePayjoinEvent {
+    /// Batching anxiety should increase the closer the deadline is.
+    /// This can be modeled as a inverse cubic function of the time left.
+    /// TODO: how do we model potential fee savings? Understanding that at most there will be one input and one output added could lead to a simple linear model.
+    fn score(&self, batching_anxiety_factor: f64) -> ActionScore {
+        let anxiety = batching_anxiety_factor * (self.time_left.pow(3) as f64 / 50.0) * -1.0;
+        let score = self
+            .balance_difference
+            .to_float_in(bitcoin::Denomination::Satoshi)
+            - (self
+                .amount_handled
+                .to_float_in(bitcoin::Denomination::Satoshi)
+                * anxiety);
+
+        ActionScore(score)
+    }
+}
+
 // TODO: implement EventCost for each event, each trait impl should define its own lambda weights
 
 // Each strategy will prioritize some specific actions over other to minimize its wallet cost function
@@ -58,6 +89,7 @@ impl PaymentObligationHandledEvent {
 #[derive(Debug, Default)]
 pub(crate) struct WalletView {
     payment_obligations: Vec<PaymentObligationData>,
+    messages: Vec<MessageData>,
     current_timestep: TimeStep,
     // TODO: utxos, feerate, cospend oppurtunities, etc.
 }
@@ -65,10 +97,12 @@ pub(crate) struct WalletView {
 impl WalletView {
     pub(crate) fn new(
         payment_obligations: Vec<PaymentObligationData>,
+        messages: Vec<MessageData>,
         current_timestep: TimeStep,
     ) -> Self {
         Self {
             payment_obligations,
+            messages,
             current_timestep,
         }
     }
@@ -106,6 +140,28 @@ fn simulate_one_action(wallet_handle: &WalletHandleMut, action: &Action) -> Vec<
             },
         ));
     }
+
+    // Check if the wallet initiated a payjoin
+    let old_payment_obligation_to_payjoin = old_info.payment_obligation_to_payjoin;
+    let new_payment_obligation_to_payjoin = new_info.payment_obligation_to_payjoin;
+    if let Some((payment_obligation_id, _)) = old_payment_obligation_to_payjoin
+        .iter()
+        .filter(|(payment_obligation_id, _)| {
+            !new_payment_obligation_to_payjoin.contains_key(payment_obligation_id)
+        })
+        .into_iter()
+        .next()
+    {
+        let po = payment_obligation_id.with(&sim).data();
+        events.push(Event::InitiatePayjoin(InitiatePayjoinEvent {
+            time_left: po.deadline.0 as i32 - wallet_view.current_timestep.0 as i32,
+            amount_handled: po.amount,
+            balance_difference: old_balance - new_balance,
+            fee_savings: Amount::ZERO, // TODO: implement this
+        }));
+    }
+
+    // TODO: check if we processed any messages
 
     events
 }
@@ -170,6 +226,51 @@ impl Strategy for UnilateralSpender {
                 }
                 _ => (),
             };
+        }
+        score
+    }
+}
+
+pub(crate) struct PayjoinStrategy {
+    pub(crate) payjoin_utility_factor: f64,
+}
+
+impl Strategy for PayjoinStrategy {
+    fn enumerate_candidate_actions(&self, state: &WalletView) -> impl Iterator<Item = Action> {
+        if state.payment_obligations.is_empty() {
+            return vec![Action::Wait].into_iter();
+        }
+        let mut actions = vec![];
+        for po in state.payment_obligations.iter() {
+            // For every payment obligation, we can spend it unilaterally
+            actions.push(Action::UnilateralSpend(po.id));
+            // Or we can initiate a payjoin with out counterparty
+            actions.push(Action::InitiatePayjoin(po.id));
+        }
+
+        // Check for messages from other wallets
+        for message in state.messages.iter() {
+            match &message.message {
+                MessageType::InitiatePayjoin(payjoin_proposal) => {
+                    actions.push(Action::ParticipateInPayjoin(payjoin_proposal.clone()));
+                }
+                _ => (),
+            }
+        }
+
+        actions.into_iter()
+    }
+
+    fn score_action(&self, action: &Action, wallet_handle: &WalletHandleMut) -> ActionScore {
+        let events = simulate_one_action(wallet_handle, action);
+        let mut score = ActionScore(0.0);
+        for event in events {
+            match event {
+                Event::InitiatePayjoin(event) => {
+                    score = score + event.score(self.payjoin_utility_factor);
+                }
+                _ => (),
+            }
         }
         score
     }
