@@ -195,13 +195,14 @@ impl<'a> BroadcastSetHandleMut<'a> {
                             if let Some(cospend_id) =
                                 info.unconfirmed_txos_in_payjoins.get(&input.id.into())
                             {
-                                info.payment_obligation_to_payjoin
+                                info.initiated_payjoins
                                     .iter()
                                     .find(|(_, c)| **c == *cospend_id)
                                     .map(|(payment_obligation_id, _)| {
                                         info.handled_payment_obligations
                                             .insert(*payment_obligation_id);
                                     });
+                                // TODO do the same for received payjoins
                             }
                         })
                     }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::path::Path;
 
 use bitcoin::{Amount, Weight};
 use graphviz_rust::{cmd::Format, dot_structures, printer::PrinterContext};
@@ -453,9 +453,10 @@ impl<'a> Simulation {
             unconfirmed_txos: OrdSet::<Outpoint>::default(),
             confirmed_utxos: OrdSet::<Outpoint>::default(),
             unconfirmed_spends: OrdSet::<Outpoint>::default(),
-            unconfirmed_txos_in_payjoins: HashMap::<Outpoint, MessageId>::default(),
-            payment_obligation_to_payjoin: HashMap::<PaymentObligationId, MessageId>::default(),
-            txid_to_handle_payment_obligation: HashMap::<TxId, PaymentObligationId>::default(),
+            unconfirmed_txos_in_payjoins: im::HashMap::<Outpoint, MessageId>::default(),
+            initiated_payjoins: im::HashMap::<PaymentObligationId, MessageId>::default(),
+            received_payjoins: im::HashMap::<PaymentObligationId, MessageId>::default(),
+            txid_to_handle_payment_obligation: im::HashMap::<TxId, PaymentObligationId>::default(),
             handled_payment_obligations: OrdSet::<PaymentObligationId>::default(),
         });
 

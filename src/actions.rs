@@ -3,56 +3,68 @@ use std::{iter::Sum, ops::Add};
 use bitcoin::Amount;
 
 use crate::{
-    message::{MessageData, MessageType, PayjoinProposal},
+    message::{MessageData, MessageId, MessageType, PayjoinProposal},
     wallet::{PaymentObligationData, PaymentObligationId, WalletHandleMut},
     TimeStep,
 };
 
 /// An Action a wallet can perform
+#[derive(Debug)]
 pub(crate) enum Action {
+    /// Spend a payment obligation unilaterally
     UnilateralSpend(PaymentObligationId),
+    /// Initiate a payjoin with a counterparty
     InitiatePayjoin(PaymentObligationId),
-    ParticipateInPayjoin(PayjoinProposal),
+    /// respond to a payjoin proposal
+    RespondToPayjoin(PayjoinProposal, PaymentObligationId, MessageId),
+    /// Do nothing. There may be better oppurtunities to spend a payment obligation or participate in a payjoin.
     Wait,
 }
 
 /// Hypothetical outcomes of an action
+#[derive(Debug)]
 pub(crate) enum Event {
     PaymentObligationHandled(PaymentObligationHandledEvent),
     InitiatePayjoin(InitiatePayjoinEvent),
+    RespondToPayjoin(RespondToPayjoinEvent),
 }
 
+#[derive(Debug)]
 pub(crate) struct PaymentObligationHandledEvent {
     /// Payment obligation amount
-    amount_handled: Amount,
+    amount_handled: f64,
     /// Balance difference after the action
-    balance_difference: Amount,
+    balance_difference: f64,
     /// Time left on the payment obligation
     time_left: i32,
 }
 
 impl PaymentObligationHandledEvent {
     fn score(&self, payment_obligation_utility_factor: f64) -> ActionScore {
-        let deadline_anxiety = self.time_left.pow(3) as f64 / 50.0;
-        ActionScore(
-            self.balance_difference
-                .to_float_in(bitcoin::Denomination::Satoshi)
-                - (payment_obligation_utility_factor
-                    * deadline_anxiety
-                    * self
-                        .amount_handled
-                        .to_float_in(bitcoin::Denomination::Satoshi)),
-        )
+        let deadlline_anxiety = {
+            // TODO: This should be configurable
+            if self.time_left > 5 {
+                0.0
+            } else {
+                // As deadline approaches, the anxiety increases
+                2.0
+            }
+        };
+        let score = self.balance_difference
+            + (payment_obligation_utility_factor * self.amount_handled * deadlline_anxiety);
+        println!(">>>>> PaymentObligationHandledEvent Score: {:?}", score);
+        ActionScore(score)
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct InitiatePayjoinEvent {
     /// Time left on the payment obligation
     time_left: i32,
     /// Amount of the payment obligation
-    amount_handled: Amount,
+    amount_handled: f64,
     /// Balance difference after the action
-    balance_difference: Amount,
+    balance_difference: f64,
     /// Fee savings from the payjoin
     fee_savings: Amount,
     // TODO: somekind of privacy gained metric?
@@ -62,15 +74,41 @@ impl InitiatePayjoinEvent {
     /// Batching anxiety should increase the closer the deadline is.
     /// This can be modeled as a inverse cubic function of the time left.
     /// TODO: how do we model potential fee savings? Understanding that at most there will be one input and one output added could lead to a simple linear model.
-    fn score(&self, batching_anxiety_factor: f64) -> ActionScore {
-        let anxiety = batching_anxiety_factor * (self.time_left.pow(3) as f64 / 50.0) * -1.0;
-        let score = self
-            .balance_difference
-            .to_float_in(bitcoin::Denomination::Satoshi)
-            - (self
-                .amount_handled
-                .to_float_in(bitcoin::Denomination::Satoshi)
-                * anxiety);
+    fn score(&self, batching_anxiety_factor: f64, payjoin_utility_factor: f64) -> ActionScore {
+        let anxiety = {
+            if self.time_left < 2 {
+                0.01
+            } else {
+                1.0
+            }
+        };
+        let score =
+            self.balance_difference + (payjoin_utility_factor * self.amount_handled * anxiety);
+        println!(">>>>> InitiatePayjoinEvent Score: {:?}", score);
+        ActionScore(score)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RespondToPayjoinEvent {
+    /// Amount of the payment obligation
+    amount_handled: f64,
+    /// Balance difference after the action
+    balance_difference: f64,
+    /// Fee savings from the payjoin
+    fee_savings: Amount,
+}
+
+impl RespondToPayjoinEvent {
+    fn score(&self, payjoin_utility_factor: f64) -> ActionScore {
+        // Responding to a payjoin should always be better than unilaterally spending at this point
+        // As there is no interaction cost. TODO in the future we will want to model the cost of doing the last round of interaction with the counterparty
+
+        // Since there is no final interaction cost, we can just score the balance difference and the amount handled
+        // However the utility should be higher for fee saving an a privacy preservation.
+        // TODO These last two are not factored in yet.
+        let score = self.balance_difference + (payjoin_utility_factor * self.amount_handled);
+        println!(">>>>> RespondToPayjoinEvent Score: {:?}", score);
 
         ActionScore(score)
     }
@@ -114,54 +152,66 @@ fn simulate_one_action(wallet_handle: &WalletHandleMut, action: &Action) -> Vec<
     let old_info = wallet_handle.info().clone();
     let old_balance = wallet_handle.handle().effective_balance();
 
-    // Deep clone the simulation
+    // Deep clone the simulation and run the action
+    let wallet_id = wallet_handle.data().id;
     let mut sim = wallet_handle.sim.clone();
-    let mut predicated_wallet_handle = wallet_handle.data().id.with_mut(&mut sim);
-    predicated_wallet_handle.do_action(action);
-    let new_info = wallet_handle.info().clone();
-    let new_balance = wallet_handle.handle().effective_balance();
+    let mut new_wallet_handle = wallet_handle.data().id.with_mut(&mut sim);
+    new_wallet_handle.do_action(action);
+    let new_wallet_handle = wallet_id.with(&sim);
+    let new_info = new_wallet_handle.info();
+    let new_balance = new_wallet_handle.effective_balance();
 
-    // Check for handled payment obligations -- we only handle one payment obligatoin per action. This may change in the future.
-    // We may also want to evaluate bundles of actions.
-    let handled_payment_obligations_diff = old_info
-        .handled_payment_obligations
-        .difference(new_info.handled_payment_obligations.clone())
-        .into_iter()
-        .next();
-    if let Some(payment_obligation) = handled_payment_obligations_diff {
-        let payment_obligation = payment_obligation.with(&sim).data();
+    let balance_difference = new_balance.to_float_in(bitcoin::Denomination::Satoshi)
+        - old_balance.to_float_in(bitcoin::Denomination::Satoshi);
+    if let Action::UnilateralSpend(payment_obligation_id) = action {
+        let payment_obligation = payment_obligation_id.with(&sim).data();
         let deadline = payment_obligation.deadline;
-
         events.push(Event::PaymentObligationHandled(
             PaymentObligationHandledEvent {
-                amount_handled: payment_obligation.amount,
-                balance_difference: old_balance - new_balance,
+                amount_handled: payment_obligation
+                    .amount
+                    .to_float_in(bitcoin::Denomination::Satoshi),
+                balance_difference,
                 time_left: deadline.0 as i32 - wallet_view.current_timestep.0 as i32,
             },
         ));
     }
 
     // Check if the wallet initiated a payjoin
-    let old_payment_obligation_to_payjoin = old_info.payment_obligation_to_payjoin;
-    let new_payment_obligation_to_payjoin = new_info.payment_obligation_to_payjoin;
-    if let Some((payment_obligation_id, _)) = old_payment_obligation_to_payjoin
-        .iter()
-        .filter(|(payment_obligation_id, _)| {
-            !new_payment_obligation_to_payjoin.contains_key(payment_obligation_id)
-        })
+    let old_initiated_payjoins = old_info.initiated_payjoins;
+    let new_initiated_payjoins = new_info.initiated_payjoins.clone();
+    if let Some((payment_obligation_id, _)) = new_initiated_payjoins
+        .difference(old_initiated_payjoins)
         .into_iter()
         .next()
     {
         let po = payment_obligation_id.with(&sim).data();
+        let amount_handled = po.amount.to_float_in(bitcoin::Denomination::Satoshi);
+        let balance_difference = amount_handled - 1.0; // TODO: fee's are not factored in yet
         events.push(Event::InitiatePayjoin(InitiatePayjoinEvent {
             time_left: po.deadline.0 as i32 - wallet_view.current_timestep.0 as i32,
-            amount_handled: po.amount,
-            balance_difference: old_balance - new_balance,
+            amount_handled,
+            balance_difference,
             fee_savings: Amount::ZERO, // TODO: implement this
         }));
     }
 
-    // TODO: check if we processed any messages and create events for payjoins that were participated in
+    let old_received_payjoins = old_info.received_payjoins;
+    let new_received_payjoins = new_info.received_payjoins.clone();
+    if let Some((payment_obligation_id, _)) = new_received_payjoins
+        .difference(old_received_payjoins)
+        .into_iter()
+        .next()
+    {
+        let po = payment_obligation_id.with(&sim).data();
+        let amount_handled = po.amount.to_float_in(bitcoin::Denomination::Satoshi);
+        let balance_difference = amount_handled; // TODO: fee's are not factored in yet
+        events.push(Event::RespondToPayjoin(RespondToPayjoinEvent {
+            amount_handled,
+            balance_difference,
+            fee_savings: Amount::ZERO, // TODO: implement this
+        }));
+    }
 
     events
 }
@@ -232,7 +282,14 @@ impl Strategy for PayjoinStrategy {
         for message in state.messages.iter() {
             match &message.message {
                 MessageType::InitiatePayjoin(payjoin_proposal) => {
-                    actions.push(Action::ParticipateInPayjoin(payjoin_proposal.clone()));
+                    // We should evaluate responding using all payment obligations that have not been handled
+                    for po in state.payment_obligations.iter() {
+                        actions.push(Action::RespondToPayjoin(
+                            payjoin_proposal.clone(),
+                            po.id,
+                            message.id,
+                        ));
+                    }
                 }
                 _ => (),
             }
@@ -257,6 +314,7 @@ impl Strategy for CompositeStrategy {
 }
 // TODO: this should be a trait once we have different scoring strategies
 pub(crate) struct CompositeScorer {
+    pub(crate) batching_anxiety_factor: f64,
     pub(crate) payjoin_utility_factor: f64,
     pub(crate) payment_obligation_utility_factor: f64,
 }
@@ -268,6 +326,8 @@ impl CompositeScorer {
         wallet_handle: &WalletHandleMut,
     ) -> ActionScore {
         let events = simulate_one_action(wallet_handle, action);
+        // For now each action should only result in one event
+        debug_assert!(events.len() <= 1);
         let mut score = ActionScore(0.0);
         for event in events {
             match event {
@@ -275,6 +335,10 @@ impl CompositeScorer {
                     score = score + event.score(self.payment_obligation_utility_factor);
                 }
                 Event::InitiatePayjoin(event) => {
+                    score = score
+                        + event.score(self.batching_anxiety_factor, self.payjoin_utility_factor);
+                }
+                Event::RespondToPayjoin(event) => {
                     score = score + event.score(self.payjoin_utility_factor);
                 }
             }

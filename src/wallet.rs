@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::{
     actions::{
         Action, CompositeScorer, CompositeStrategy, PayjoinStrategy, Strategy, UnilateralSpender,
@@ -14,7 +12,7 @@ use bdk_coin_select::{
     TargetFee, TargetOutputs, TR_DUST_RELAY_MIN_VALUE, TR_KEYSPEND_TXIN_WEIGHT,
 };
 use bitcoin::{transaction::InputWeightPrediction, Amount};
-use im::{OrdSet, Vector};
+use im::{HashMap, OrdSet, Vector};
 
 use crate::transaction::*;
 
@@ -38,7 +36,10 @@ define_entity_mut_updatable!(
         pub(crate) unconfirmed_transactions: OrdSet<TxId>,
         pub(crate) unconfirmed_txos: OrdSet<Outpoint>,  // compute CPFP cost
         pub(crate) unconfirmed_spends: OrdSet<Outpoint>, // RBFable
-        pub(crate) payment_obligation_to_payjoin: HashMap<PaymentObligationId, MessageId>,
+        /// Payjoins that I sent to other wallets
+        pub(crate) initiated_payjoins: HashMap<PaymentObligationId, MessageId>,
+        /// Payjoins that I received from other wallets. A mapping of what payment obligation was used in this payjoin
+        pub(crate) received_payjoins: HashMap<PaymentObligationId, MessageId>,
         /// Map of unconfirmed txos to the cospends that they are in
         // TODO: need something similar for outputs as to prevent double spending to the same payment obligation
         pub(crate) unconfirmed_txos_in_payjoins: HashMap<Outpoint, MessageId>,
@@ -121,9 +122,7 @@ impl<'a> WalletHandle<'a> {
                     .select_until_target_met(target)
                     .expect("coin selection should always succeed since payments consider budger lower bound");
             }
-            Ok(score) => {
-                println!("BNB found a solution with score {}", score);
-            }
+            Ok(_) => (),
         };
 
         let selection = coin_selector
@@ -149,10 +148,10 @@ impl<'a> WalletHandle<'a> {
             !self.info().unconfirmed_spends.contains(&o.outpoint())
             // TODO Startegies should inform which inputs can be spendable.
             // TODO: these inputs should unlock if the payjoin is expired or the associated payment obligation is due soon (i.e payment anxiety)
-            // && !self
-            //     .info()
-            //     .unconfirmed_txos_in_payjoins
-            //     .contains_key(&o.outpoint())
+            || !self
+                .info()
+                .unconfirmed_txos_in_payjoins
+                .contains_key(&o.outpoint())
         })
     }
 
@@ -186,49 +185,6 @@ impl<'a> WalletHandleMut<'a> {
             .address_data
             .push(AddressData { wallet_id: self.id });
         id
-    }
-
-    /// Returns the payjoin proposal ids that need to be processed
-    fn read_messages(&mut self) -> Vec<(MessageId, PayjoinProposal)> {
-        let my_id = self.id;
-        let messages_to_process = self
-            .sim
-            .messages
-            .iter()
-            .filter(|message| !self.data().messages_processed.contains(&message.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if messages_to_process.is_empty() {
-            return Vec::new();
-        }
-
-        let mut payjoin_ids_to_process = Vec::new();
-
-        for message in messages_to_process.iter() {
-            if message.from == my_id {
-                // Ignore messages from myself
-                continue;
-            }
-            if message.to.is_none() {
-                // Ignore broadcast messages for now
-                continue;
-            }
-            if message.to.unwrap() != my_id {
-                // Ignore messages not for me
-                continue;
-            }
-            match &message.message {
-                MessageType::InitiatePayjoin(payjoin_proposal) => {
-                    payjoin_ids_to_process.push((message.id, payjoin_proposal.clone()));
-                }
-            }
-        }
-
-        // Plus one to avoid processing the same message twice
-        self.data_mut()
-            .messages_processed
-            .extend(messages_to_process.iter().map(|message| message.id));
-        payjoin_ids_to_process
     }
 
     /// stateless utility function to construct a transaction for a given payment obligation
@@ -272,78 +228,50 @@ impl<'a> WalletHandleMut<'a> {
         tx
     }
 
-    // TODO: bring this back as as an strategy
-    /// Returns the next payment obligation that is not handled
-    /// TODO: this should be a priority queue
-    // fn next_payment_obligation(&'a self) -> Option<PaymentObligationId> {
-    //     self.info()
-    //         .payment_obligations
-    //         .clone()
-    //         .difference(self.info().handled_payment_obligations.clone())
-    //         .iter()
-    //         .filter(|payment_obligation_id| {
-    //             let anxiety_factor = self.deadline_anxiety(
-    //                 payment_obligation_id.with(self.sim).data().deadline.0 as i32,
-    //             );
-    //             // If already in a cospend or not due soon
-    //             !self
-    //                 .info()
-    //                 .payment_obligation_to_cospend
-    //                 .contains_key(payment_obligation_id)
-    //                 || anxiety_factor <= self.sim.config.payment_obligation_deadline_threshold
-    //         })
-    //         .next()
-    //         .cloned()
-    // }
+    fn participate_in_payjoin(
+        &mut self,
+        message_id: &MessageId,
+        payjoin: &PayjoinProposal,
+        payment_obligation_id: &PaymentObligationId,
+    ) -> TxId {
+        // if we have a payment obligation then lets batch it with this payjoin
+        let payment_obligation = payment_obligation_id.with(self.sim).data().clone();
+        let change_addr = self.new_address();
+        let to_address = payment_obligation.to.with_mut(self.sim).new_address();
+        let mut tx_template =
+            self.construct_transaction_template(&payment_obligation, &change_addr, &to_address);
+        // "Lock" The inputs to this payjoin. These inputs can be spent if the payjoin is expired and our payment is due soon
+        for input in tx_template.inputs.iter() {
+            self.info_mut()
+                .unconfirmed_txos_in_payjoins
+                .insert(input.outpoint, *message_id);
+        }
 
-    // fn participate_in_cospend(
-    //     &mut self,
-    //     message_id: MessageId,
-    //     cospend: &PayjoinProposal,
-    // ) -> Option<TxId> {
-    //     if cospend.valid_till < self.sim.current_timestep {
-    //         return None;
-    //     }
-    //     // if we have a payment obligation then lets batch it with this cospend
-    //     if let Some(payment_obligation_id) = self.next_payment_obligation() {
-    //         let payment_obligation = payment_obligation_id.with(self.sim).data().clone();
-    //         let change_addr = self.new_address();
-    //         let to_address = payment_obligation.to.with_mut(self.sim).new_address();
-    //         let mut tx_template =
-    //             self.construct_transaction_template(&payment_obligation, &change_addr, &to_address);
-    //         // "Lock" The inputs to this cospend. These inputs can be spent if the cospend is expired and our payment is due soon
-    //         for input in tx_template.inputs.iter() {
-    //             self.info_mut()
-    //                 .unconfirmed_txos_in_cospends
-    //                 .insert(input.outpoint, message_id);
-    //         }
+        self.ack_transaction(&mut tx_template);
+        tx_template.inputs.extend(payjoin.tx.inputs.iter().cloned());
+        tx_template
+            .outputs
+            .extend(payjoin.tx.outputs.iter().cloned());
+        tx_template
+            .wallet_acks
+            .extend(payjoin.tx.wallet_acks.iter().cloned());
+        debug_assert!(tx_template.wallet_acks.contains(&self.id));
 
-    //         self.ack_transaction(&mut tx_template);
-    //         tx_template.inputs.extend(cospend.tx.inputs.iter().cloned());
-    //         tx_template
-    //             .outputs
-    //             .extend(cospend.tx.outputs.iter().cloned());
-    //         tx_template
-    //             .wallet_acks
-    //             .extend(cospend.tx.wallet_acks.iter().cloned());
+        let tx_id = self.spend_tx(tx_template);
 
-    //         debug_assert!(tx_template.wallet_acks.contains(&self.id));
+        // Keep an index of what payment obligations are being handled in which payjoins
+        self.info_mut()
+            .received_payjoins
+            .insert(*payment_obligation_id, *message_id);
+        self.info_mut()
+            .txid_to_handle_payment_obligation
+            .insert(tx_id, *payment_obligation_id);
 
-    //         let tx_id = self.spend_tx(tx_template);
+        // Mark the message as processed
+        self.data_mut().messages_processed.insert(*message_id);
 
-    //         // Keep an index of what payment obligations are being handled in which cospends
-    //         self.info_mut()
-    //             .payment_obligation_to_cospend
-    //             .insert(payment_obligation_id, message_id);
-    //         self.info_mut()
-    //             .txid_to_handle_payment_obligation
-    //             .insert(tx_id, payment_obligation_id);
-
-    //         return Some(tx_id);
-    //     }
-
-    //     None
-    // }
+        tx_id
+    }
 
     fn create_payjoin(
         &mut self,
@@ -369,7 +297,7 @@ impl<'a> WalletHandleMut<'a> {
                 .insert(input.outpoint, message_id);
         }
         self.info_mut()
-            .payment_obligation_to_payjoin
+            .initiated_payjoins
             .insert(payment_obligation.id, message_id);
 
         MessageData {
@@ -389,10 +317,20 @@ impl<'a> WalletHandleMut<'a> {
             .filter(|message| !self.data().messages_processed.contains(&message.id))
             .cloned()
             .collect::<Vec<_>>();
+        let my_id = self.id;
         for message in messages.iter() {
+            if message.from == my_id {
+                continue;
+            }
+            if message.to.is_none() {
+                continue;
+            }
+            if message.to.unwrap() != my_id {
+                continue;
+            }
             match &message.message {
                 MessageType::InitiatePayjoin(payjoin_proposal) => {
-                    payjoins.push(payjoin_proposal.clone());
+                    payjoins.push(payjoin_proposal.clone())
                 }
             }
         }
@@ -417,14 +355,18 @@ impl<'a> WalletHandleMut<'a> {
                 let message = self.create_payjoin(po);
                 self.sim.broadcast_message(message);
             }
-            _ => unimplemented!(),
+            Action::RespondToPayjoin(payjoin_proposal, po, message_id) => {
+                let tx_id = self.participate_in_payjoin(message_id, payjoin_proposal, po);
+                self.broadcast(vec![tx_id]);
+            }
         }
     }
 
     pub(crate) fn wake_up(&'a mut self) {
         let scorer = CompositeScorer {
-            payjoin_utility_factor: 0.01,
-            payment_obligation_utility_factor: 0.01,
+            payjoin_utility_factor: 2.0,
+            payment_obligation_utility_factor: 1.0,
+            batching_anxiety_factor: 0.1,
         };
         let strategy = CompositeStrategy {
             strategies: vec![Box::new(UnilateralSpender), Box::new(PayjoinStrategy)],
@@ -433,46 +375,10 @@ impl<'a> WalletHandleMut<'a> {
         let action = strategy
             .enumerate_candidate_actions(&wallet_view)
             .into_iter()
-            .min_by_key(|action| scorer.score_action(action, self))
+            .max_by_key(|action| scorer.score_action(action, self))
             .unwrap_or(Action::Wait);
+        println!(">>>>> Chose action: {:?}", action);
         self.do_action(&action);
-
-        // TODO: bring all the payjoin logic back as a strategy
-        // let cospend_to_process = self.read_messages();
-        // let mut txs_to_broadcast = Vec::new();
-        // for (message_id, cospend) in cospend_to_process {
-        //     if let Some(tx_id) = self.participate_in_cospend(message_id, &cospend) {
-        //         txs_to_broadcast.push(tx_id);
-        //     }
-        // }
-
-        // // If I have any payment obligations I should try to spend them if they are due soon
-        // // Other wise I should register my inputs and look for others to collaborate with
-        // if let Some(payment_obligation_id) = self.next_payment_obligation() {
-        //     let payment_obligation = payment_obligation_id.with(self.sim).data().clone();
-
-        //     // TODO: this should be configurable
-        //     // Right now the wallets are patient for the most part
-        //     if self.deadline_anxiety(payment_obligation.deadline.0 as i32)
-        //         <= self.sim.config.payment_obligation_deadline_threshold
-        //     {
-        //         self.handle_payment_obligations(&payment_obligation);
-        //         return;
-        //     }
-
-        //     // If its not due soon lets batch the payment
-        //     let message_id = MessageId(self.sim.messages.len());
-        //     let cospend = self.create_cospend(message_id, &payment_obligation);
-        //     let message = MessageData {
-        //         id: message_id,
-        //         from: self.id,
-        //         to: Some(payment_obligation.to),
-        //         message: MessageType::RegisterCospend(cospend),
-        //     };
-        //     self.sim.broadcast_message(message.clone());
-
-        //     self.broadcast(txs_to_broadcast);
-        // }
     }
 
     fn handle_payment_obligation(
