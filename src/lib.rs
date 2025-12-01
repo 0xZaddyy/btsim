@@ -154,8 +154,6 @@ pub struct SimulationBuilder {
     block_interval: usize,
     /// Number of payment obligations to create
     num_payment_obligations: usize,
-
-    payment_obligation_deadline_threshold: f64,
 }
 
 impl SimulationBuilder {
@@ -164,7 +162,6 @@ impl SimulationBuilder {
         max_timestep: usize,
         block_interval: usize,
         num_payment_obligations: usize,
-        payment_obligation_deadline_threshold: f64,
     ) -> Self {
         debug_assert!(num_wallets >= 2);
         let seed = rand::thread_rng().gen_range(0..u64::MAX);
@@ -174,7 +171,6 @@ impl SimulationBuilder {
             max_timestep: TimeStep(max_timestep),
             block_interval,
             num_payment_obligations,
-            payment_obligation_deadline_threshold,
         }
     }
 
@@ -184,7 +180,6 @@ impl SimulationBuilder {
         max_timestep: usize,
         block_interval: usize,
         num_payment_obligations: usize,
-        payment_obligation_deadline_threshold: f64,
     ) -> Self {
         debug_assert!(num_wallets >= 2);
         Self {
@@ -193,7 +188,6 @@ impl SimulationBuilder {
             max_timestep: TimeStep(max_timestep),
             block_interval,
             num_payment_obligations,
-            payment_obligation_deadline_threshold,
         }
     }
 
@@ -239,7 +233,6 @@ impl SimulationBuilder {
                 max_timestep: self.max_timestep,
                 block_interval: self.block_interval,
                 num_payment_obligations: self.num_payment_obligations,
-                payment_obligation_deadline_threshold: self.payment_obligation_deadline_threshold,
             },
         };
 
@@ -291,7 +284,6 @@ struct SimulationConfig {
     max_timestep: TimeStep,
     block_interval: usize,
     num_payment_obligations: usize,
-    payment_obligation_deadline_threshold: f64,
 }
 
 /// all entities are numbered sequentially
@@ -702,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_universe() {
-        let mut sim = SimulationBuilder::new(42, 5, 20, 1, 10, 2.0).build();
+        let mut sim = SimulationBuilder::new(42, 5, 20, 1, 10).build();
         sim.assert_invariants();
         sim.build_universe();
         let result = sim.run();
@@ -729,7 +721,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let mut sim = SimulationBuilder::new(42, 2, 20, 1, 10, 2.0).build();
+        let mut sim = SimulationBuilder::new(42, 2, 20, 1, 10).build();
         sim.assert_invariants();
 
         let alice = sim.new_wallet();

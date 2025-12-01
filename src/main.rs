@@ -13,8 +13,6 @@ struct Args {
     block_interval: usize,
     #[arg(short, long)]
     seed: Option<u64>,
-    #[arg(short, long)]
-    obligation_deadline_threshold: f64,
 }
 
 fn main() {
@@ -25,7 +23,6 @@ fn main() {
         args.time_steps,
         args.block_interval,
         args.payment_obligations,
-        args.obligation_deadline_threshold,
     )
     .build();
 
