@@ -42,17 +42,16 @@ pub(crate) struct PaymentObligationHandledEvent {
 
 impl PaymentObligationHandledEvent {
     fn score(&self, payment_obligation_utility_factor: f64) -> ActionScore {
-        let deadlline_anxiety = {
+        let utility = {
             // TODO: This should be configurable
             if self.time_left > 5 {
                 0.0
             } else {
-                // As deadline approaches, the anxiety increases
-                2.0
+                // This should be a function of time left
+                payment_obligation_utility_factor * 2.0
             }
         };
-        let score = self.balance_difference
-            + (payment_obligation_utility_factor * self.amount_handled * deadlline_anxiety);
+        let score = self.balance_difference + (self.amount_handled * utility);
         debug!("PaymentObligationHandledEvent score: {:?}", score);
         ActionScore(score)
     }
@@ -72,19 +71,18 @@ pub(crate) struct InitiatePayjoinEvent {
 }
 
 impl InitiatePayjoinEvent {
-    /// Batching anxiety should increase the closer the deadline is.
+    /// Batching anxiety should increase and payjoin utility should decrease the closer the deadline is.
     /// This can be modeled as a inverse cubic function of the time left.
     /// TODO: how do we model potential fee savings? Understanding that at most there will be one input and one output added could lead to a simple linear model.
-    fn score(&self, batching_anxiety_factor: f64, payjoin_utility_factor: f64) -> ActionScore {
-        let anxiety = {
+    fn score(&self, payjoin_utility_factor: f64) -> ActionScore {
+        let utility = {
             if self.time_left < 2 {
-                0.01
+                payjoin_utility_factor * 0.01
             } else {
-                1.0
+                payjoin_utility_factor
             }
         };
-        let score =
-            self.balance_difference + (payjoin_utility_factor * self.amount_handled * anxiety);
+        let score = self.balance_difference + (self.amount_handled * utility);
         debug!("InitiatePayjoinEvent score: {:?}", score);
         ActionScore(score)
     }
@@ -114,15 +112,6 @@ impl RespondToPayjoinEvent {
         ActionScore(score)
     }
 }
-
-// TODO: implement EventCost for each event, each trait impl should define its own lambda weights
-
-// Each strategy will prioritize some specific actions over other to minimize its wallet cost function
-// E.g the unilateral spender associates high cost with batched transaction perhaps bc they dont like interactivity and don't care much for privacy
-// They want to ensure they never miss a deadline. In that case the weights behind their deadline misses are high and batched payments will be low. i.e high payment anxiety
-// TODO: should strategies do more than one thing per timestep?
-
-// Cost function should evalute over unhandled payment obligations and payjoin / cospend oppurtunities. i.e Given all the payment obligations
 
 /// State of the wallet that can be used to potential enumerate actions
 #[derive(Debug, Default)]
@@ -292,7 +281,6 @@ impl Strategy for PayjoinStrategy {
                         ));
                     }
                 }
-                _ => (),
             }
         }
 
@@ -315,7 +303,6 @@ impl Strategy for CompositeStrategy {
 }
 // TODO: this should be a trait once we have different scoring strategies
 pub(crate) struct CompositeScorer {
-    pub(crate) batching_anxiety_factor: f64,
     pub(crate) payjoin_utility_factor: f64,
     pub(crate) payment_obligation_utility_factor: f64,
 }
@@ -327,7 +314,7 @@ impl CompositeScorer {
         wallet_handle: &WalletHandleMut,
     ) -> ActionScore {
         let events = simulate_one_action(wallet_handle, action);
-        // For now each action should only result in one event
+        // For now each action should only result in one event or none if we are waiting
         debug_assert!(events.len() <= 1);
         let mut score = ActionScore(0.0);
         for event in events {
@@ -336,8 +323,7 @@ impl CompositeScorer {
                     score = score + event.score(self.payment_obligation_utility_factor);
                 }
                 Event::InitiatePayjoin(event) => {
-                    score = score
-                        + event.score(self.batching_anxiety_factor, self.payjoin_utility_factor);
+                    score = score + event.score(self.payjoin_utility_factor);
                 }
                 Event::RespondToPayjoin(event) => {
                     score = score + event.score(self.payjoin_utility_factor);

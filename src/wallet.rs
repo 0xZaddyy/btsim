@@ -352,7 +352,6 @@ impl<'a> WalletHandleMut<'a> {
         let scorer = CompositeScorer {
             payjoin_utility_factor: 2.0,
             payment_obligation_utility_factor: 1.0,
-            batching_anxiety_factor: 0.1,
         };
         let strategy = CompositeStrategy {
             strategies: vec![Box::new(UnilateralSpender), Box::new(PayjoinStrategy)],
