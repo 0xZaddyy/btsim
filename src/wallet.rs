@@ -150,7 +150,7 @@ impl<'a> WalletHandle<'a> {
             !self.info().unconfirmed_spends.contains(&o.outpoint())
             // TODO Startegies should inform which inputs can be spendable.
             // TODO: these inputs should unlock if the payjoin is expired or the associated payment obligation is due soon (i.e payment anxiety)
-            || !self
+            && !self
                 .info()
                 .unconfirmed_txos_in_payjoins
                 .contains_key(&o.outpoint())

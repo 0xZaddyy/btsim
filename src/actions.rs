@@ -43,12 +43,15 @@ pub(crate) struct PaymentObligationHandledEvent {
 impl PaymentObligationHandledEvent {
     fn score(&self, payment_obligation_utility_factor: f64) -> ActionScore {
         let utility = {
-            // TODO: This should be configurable
             if self.time_left > 5 {
                 0.0
-            } else {
-                // This should be a function of time left
+            } else if self.time_left <= 5 && self.time_left > 2 {
+                payment_obligation_utility_factor
+            } else if self.time_left <= 2 && self.time_left > 0 {
                 payment_obligation_utility_factor * 2.0
+            } else {
+                // Overdue
+                payment_obligation_utility_factor * 10.0
             }
         };
         let score = self.balance_difference + (self.amount_handled * utility);
@@ -76,10 +79,14 @@ impl InitiatePayjoinEvent {
     /// TODO: how do we model potential fee savings? Understanding that at most there will be one input and one output added could lead to a simple linear model.
     fn score(&self, payjoin_utility_factor: f64) -> ActionScore {
         let utility = {
-            if self.time_left < 2 {
-                payjoin_utility_factor * 0.01
-            } else {
+            if self.time_left > 5 {
+                payjoin_utility_factor * 5.0
+            } else if self.time_left <= 5 && self.time_left >= 2 {
+                // Riskier to initiate a payjoin the closer the deadline is
                 payjoin_utility_factor
+            } else {
+                // Overdue, should not prefer to initiate a payjoin
+                0.0
             }
         };
         let score = self.balance_difference + (self.amount_handled * utility);
@@ -315,6 +322,7 @@ impl CompositeScorer {
     ) -> ActionScore {
         let events = simulate_one_action(wallet_handle, action);
         // For now each action should only result in one event or none if we are waiting
+        // TODO: wallets should evaluate waiting and score it high if they are expecting payments from payjoin compatible wallets
         debug_assert!(events.len() <= 1);
         let mut score = ActionScore(0.0);
         for event in events {
