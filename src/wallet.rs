@@ -320,11 +320,21 @@ impl<'a> WalletHandleMut<'a> {
             .cloned()
             .collect::<Vec<_>>();
 
+        // Filter out payment obligations that are already handled, or have an initiated/received payjoin
+        // TODO: in the future where we want to support fallbacks we should not filter out initiated payjoins
+        // Rather they are considered a seperate action.
+        let initiated_po_ids: OrdSet<PaymentObligationId> =
+            self.info().initiated_payjoins.keys().cloned().collect();
+        let received_po_ids: OrdSet<PaymentObligationId> =
+            self.info().received_payjoins.keys().cloned().collect();
+
         let payment_obligations = self
             .info()
             .payment_obligations
             .clone()
             .difference(self.info().handled_payment_obligations.clone())
+            .difference(initiated_po_ids)
+            .difference(received_po_ids)
             .iter()
             .map(|po| po.with(self.sim).data().clone())
             .collect::<Vec<_>>();
