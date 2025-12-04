@@ -81,7 +81,7 @@ impl InitiatePayjoinOutcome {
         let utility = {
             if self.time_left > 5 {
                 payjoin_utility_factor * 5.0
-            } else if self.time_left <= 5 && self.time_left >= 2 {
+            } else if self.time_left <= 5 && self.time_left > 2 {
                 // Riskier to initiate a payjoin the closer the deadline is
                 payjoin_utility_factor
             } else {

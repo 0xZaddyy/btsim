@@ -265,9 +265,6 @@ impl<'a> WalletHandleMut<'a> {
         self.info_mut()
             .received_payjoins
             .insert(*payment_obligation_id, *message_id);
-        self.info_mut()
-            .txid_to_handle_payment_obligation
-            .insert(tx_id, *payment_obligation_id);
 
         // Mark the message as processed
         self.data_mut().messages_processed.insert(*message_id);
@@ -319,23 +316,25 @@ impl<'a> WalletHandleMut<'a> {
             .filter(|message| message.from != self.id && message.to == self.id)
             .cloned()
             .collect::<Vec<_>>();
+        let wallet_info = self.info();
 
         // Filter out payment obligations that are already handled, or have an initiated/received payjoin
         // TODO: in the future where we want to support fallbacks we should not filter out initiated payjoins
         // Rather they are considered a seperate action.
         let initiated_po_ids: OrdSet<PaymentObligationId> =
-            self.info().initiated_payjoins.keys().cloned().collect();
+            wallet_info.initiated_payjoins.keys().cloned().collect();
         let received_po_ids: OrdSet<PaymentObligationId> =
-            self.info().received_payjoins.keys().cloned().collect();
+            wallet_info.received_payjoins.keys().cloned().collect();
 
-        let payment_obligations = self
-            .info()
+        let payment_obligations = wallet_info
             .payment_obligations
             .clone()
-            .difference(self.info().handled_payment_obligations.clone())
-            .difference(initiated_po_ids)
-            .difference(received_po_ids)
             .iter()
+            .filter(|po_id| {
+                !wallet_info.handled_payment_obligations.contains(po_id)
+                    && !initiated_po_ids.contains(po_id)
+                    && !received_po_ids.contains(po_id)
+            })
             .filter(|po| po.with(self.sim).data().reveal_time <= self.sim.current_timestep)
             .map(|po| po.with(self.sim).data().clone())
             .collect::<Vec<_>>();
@@ -368,9 +367,8 @@ impl<'a> WalletHandleMut<'a> {
         let strategy = CompositeStrategy {
             strategies: vec![Box::new(UnilateralSpender), Box::new(PayjoinStrategy)],
         };
-        let wallet_view = self.wallet_view();
         let action = strategy
-            .enumerate_candidate_actions(&wallet_view)
+            .enumerate_candidate_actions(&self.wallet_view())
             .into_iter()
             .max_by_key(|action| scorer.score_action(action, self))
             .unwrap_or(Action::Wait);

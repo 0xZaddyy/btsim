@@ -270,9 +270,6 @@ impl SimulationBuilder {
             invalidated_txs: OrdSet::default(),
         });
 
-        // First wallet represents the "miners"
-        sim.new_wallet();
-
         for _ in 0..self.num_wallets {
             let wallet_id = sim.new_wallet();
             sim.economic_graph.grow(wallet_id);
