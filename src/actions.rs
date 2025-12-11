@@ -9,6 +9,33 @@ use crate::{
     Simulation, TimeStep,
 };
 
+fn piecewise_linear(x: f64, points: &[(f64, f64)]) -> f64 {
+    assert!(points.len() >= 2, "need at least two points");
+
+    // Clamp on either end of the points
+    if x <= points[0].0 {
+        return points[0].1;
+    }
+
+    let last = points.len() - 1;
+    if x >= points[last].0 {
+        return points[last].1;
+    }
+
+    // Find segment [x_i, x_{i+1}] containing x
+    for window in points.windows(2) {
+        let (x0, y0) = window[0];
+        let (x1, y1) = window[1];
+
+        if x >= x0 && x <= x1 {
+            let t = (x - x0) / (x1 - x0);
+            return y0 + t * (y1 - y0);
+        }
+    }
+
+    unreachable!("x did not fall into any segment; are points sorted?");
+}
+
 /// An Action a wallet can perform
 #[derive(Debug)]
 pub(crate) enum Action {
@@ -44,18 +71,12 @@ pub(crate) struct PaymentObligationHandledOutcome {
 
 impl PaymentObligationHandledOutcome {
     fn score(&self, payment_obligation_utility_factor: f64) -> ActionScore {
-        let utility = {
-            if self.time_left > 5 {
-                0.0
-            } else if self.time_left <= 5 && self.time_left > 2 {
-                payment_obligation_utility_factor
-            } else if self.time_left <= 2 && self.time_left > 0 {
-                payment_obligation_utility_factor * 2.0
-            } else {
-                // Overdue
-                payment_obligation_utility_factor * 10.0
-            }
-        };
+        let points = [
+            (0.0, 2.0 * payment_obligation_utility_factor),
+            (2.0, payment_obligation_utility_factor),
+            (5.0, 0.0),
+        ];
+        let utility = piecewise_linear(self.time_left as f64, &points);
         let score = self.balance_difference + (self.amount_handled * utility);
         debug!("PaymentObligationHandledEvent score: {:?}", score);
         ActionScore(score)
@@ -80,17 +101,13 @@ impl InitiatePayjoinOutcome {
     /// This can be modeled as a inverse cubic function of the time left.
     /// TODO: how do we model potential fee savings? Understanding that at most there will be one input and one output added could lead to a simple linear model.
     fn score(&self, payjoin_utility_factor: f64) -> ActionScore {
-        let utility = {
-            if self.time_left > 5 {
-                payjoin_utility_factor * 5.0
-            } else if self.time_left <= 5 && self.time_left > 2 {
-                // Riskier to initiate a payjoin the closer the deadline is
-                payjoin_utility_factor
-            } else {
-                // Overdue, should not prefer to initiate a payjoin
-                0.0
-            }
-        };
+        let points = [
+            (0.0, 0.0),
+            (2.0, payjoin_utility_factor),
+            (5.0, 5.0 * payjoin_utility_factor),
+        ];
+        let utility = piecewise_linear(self.time_left as f64, &points);
+
         let score = self.balance_difference + (self.amount_handled * utility);
         debug!("InitiatePayjoinEvent score: {:?}", score);
         ActionScore(score)
