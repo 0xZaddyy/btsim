@@ -16,8 +16,11 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultiPartyPayjoinSession {
+    /// The payment obligations that are being handled in this session. Specific for each wallet
     pub(crate) payment_obligation_ids: Vec<PaymentObligationId>,
+    /// The transaction template for this session. Specific for each wallet
     pub(crate) tx_template: TxData,
+    /// The state of the session
     pub(crate) state: TxConstructionState,
 }
 
@@ -35,7 +38,6 @@ pub(crate) struct SentBulletinBoardId<'a> {
     pub(crate) bulletin_board_id: BulletinBoardId,
     pub(crate) tx_template: TxData,
     pub(crate) sim: &'a mut Simulation,
-    pub(crate) n: u16,
 }
 
 impl<'a> SentBulletinBoardId<'a> {
@@ -43,13 +45,11 @@ impl<'a> SentBulletinBoardId<'a> {
         sim: &'a mut Simulation,
         bulletin_board_id: BulletinBoardId,
         tx_template: TxData,
-        n: u16,
     ) -> Self {
         Self {
             bulletin_board_id,
             tx_template,
             sim,
-            n,
         }
     }
 
@@ -60,12 +60,7 @@ impl<'a> SentBulletinBoardId<'a> {
                 BroadcastMessageType::ContributeInputs(input.outpoint.clone()),
             );
         }
-        SentInputs::new(
-            self.sim,
-            self.bulletin_board_id,
-            self.tx_template.clone(),
-            self.n,
-        )
+        SentInputs::new(self.sim, self.bulletin_board_id, self.tx_template.clone())
     }
 }
 
@@ -73,7 +68,6 @@ pub(crate) struct SentInputs<'a> {
     pub(crate) bulletin_board_id: BulletinBoardId,
     pub(crate) tx_template: TxData,
     pub(crate) sim: &'a mut Simulation,
-    pub(crate) n: u16,
 }
 
 impl<'a> SentInputs<'a> {
@@ -81,13 +75,11 @@ impl<'a> SentInputs<'a> {
         sim: &'a mut Simulation,
         bulletin_board_id: BulletinBoardId,
         tx_template: TxData,
-        n: u16,
     ) -> Self {
         Self {
             bulletin_board_id,
             tx_template,
             sim,
-            n,
         }
     }
 
@@ -105,11 +97,6 @@ impl<'a> SentInputs<'a> {
     }
 
     pub(crate) fn have_enough_inputs(self) -> Option<SentOutputs<'a>> {
-        let inputs = self.read_txin_messages();
-        if inputs.len() < self.n as usize {
-            return None;
-        }
-
         // Broadcast my outputs
         for output in self.tx_template.outputs.iter() {
             self.sim.add_message_to_bulletin_board(
@@ -122,7 +109,6 @@ impl<'a> SentInputs<'a> {
             self.sim,
             self.bulletin_board_id,
             self.tx_template.clone(),
-            self.n,
         ))
     }
 }
@@ -132,7 +118,6 @@ pub(crate) struct SentOutputs<'a> {
     pub(crate) bulletin_board_id: BulletinBoardId,
     pub(crate) tx_template: TxData,
     pub(crate) sim: &'a mut Simulation,
-    pub(crate) n: u16,
 }
 
 impl<'a> SentOutputs<'a> {
@@ -140,13 +125,11 @@ impl<'a> SentOutputs<'a> {
         sim: &'a mut Simulation,
         bulletin_board_id: BulletinBoardId,
         tx_template: TxData,
-        n: u16,
     ) -> Self {
         Self {
             bulletin_board_id,
             tx_template,
             sim,
-            n,
         }
     }
 
@@ -164,45 +147,29 @@ impl<'a> SentOutputs<'a> {
     }
 
     pub(crate) fn have_enough_outputs(self) -> Option<SentReadyToSign<'a>> {
-        let outputs = self.read_txout_messages();
-        if outputs.len() < self.n as usize {
-            return None;
+        // Broadcast my ready to sign message for all the inputs I have contributed
+        for _ in 0..self.tx_template.inputs.len() {
+            self.sim.add_message_to_bulletin_board(
+                self.bulletin_board_id,
+                BroadcastMessageType::ReadyToSign(),
+            );
         }
-        // Broadcast my ready to sign message
-        self.sim.add_message_to_bulletin_board(
-            self.bulletin_board_id,
-            BroadcastMessageType::ReadyToSign(),
-        );
 
-        Some(SentReadyToSign::new(
-            self.sim,
-            self.bulletin_board_id,
-            self.tx_template.clone(),
-            self.n,
-        ))
+        Some(SentReadyToSign::new(self.sim, self.bulletin_board_id))
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct SentReadyToSign<'a> {
     pub(crate) bulletin_board_id: BulletinBoardId,
-    pub(crate) tx_template: TxData,
     pub(crate) sim: &'a mut Simulation,
-    pub(crate) n: u16,
 }
 
 impl<'a> SentReadyToSign<'a> {
-    pub(crate) fn new(
-        sim: &'a mut Simulation,
-        bulletin_board_id: BulletinBoardId,
-        tx_template: TxData,
-        n: u16,
-    ) -> Self {
+    pub(crate) fn new(sim: &'a mut Simulation, bulletin_board_id: BulletinBoardId) -> Self {
         Self {
             bulletin_board_id,
-            tx_template,
             sim,
-            n,
         }
     }
 
@@ -214,9 +181,18 @@ impl<'a> SentReadyToSign<'a> {
             .count()
     }
 
+    fn get_all_input_messages(&self) -> usize {
+        self.sim.bulletin_boards[self.bulletin_board_id.0]
+            .messages
+            .iter()
+            .filter(|message| matches!(message, BroadcastMessageType::ContributeInputs(_)))
+            .count()
+    }
+
     pub(crate) fn have_enough_ready_to_sign(self) -> Option<TxData> {
         let ready_to_sign_messages = self.read_ready_to_sign_messages();
-        if ready_to_sign_messages < self.n as usize {
+        let n = self.get_all_input_messages();
+        if ready_to_sign_messages < n {
             return None;
         }
         // Signatures are abstracted away, so the "leader" can just boradcast to the network
@@ -384,7 +360,6 @@ mod tests {
 
     #[test]
     fn test_state_machine() {
-        let n = 3;
         let mut sim = test_harness::create_minimal_simulation(3);
 
         let tx_template_1 = test_harness::create_mock_tx_template(&mut sim, 2, 1);
@@ -394,7 +369,7 @@ mod tests {
         test_harness::add_other_outputs(&mut sim, bulletin_board_id, 2);
         test_harness::add_other_ready_to_sign(&mut sim, bulletin_board_id, 2);
 
-        let session_1 = SentBulletinBoardId::new(&mut sim, bulletin_board_id, tx_template_1, n);
+        let session_1 = SentBulletinBoardId::new(&mut sim, bulletin_board_id, tx_template_1);
         let session_1 = session_1.send_inputs();
 
         // Send other inputs
