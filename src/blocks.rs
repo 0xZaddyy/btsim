@@ -103,11 +103,11 @@ impl<'a> BroadcastSetHandleMut<'a> {
                     .iter()
                     .map(|input_id| input_id.txid)
                     .collect::<OrdSet<TxId>>();
-                for conflicting_tx in spends.without(&tx.id).intersection(unconfirmed_txs.clone())
-                // FIXME pr to im, unnecessary clone
-                {
-                    unconfirmed_txs.remove(&conflicting_tx);
-                    invalidated_txs.insert(conflicting_tx);
+                for conflicting_tx in spends.without(&tx.id).iter() {
+                    if unconfirmed_txs.contains(conflicting_tx) {
+                        unconfirmed_txs.remove(conflicting_tx);
+                        invalidated_txs.insert(*conflicting_tx);
+                    }
                 }
             }
         }
