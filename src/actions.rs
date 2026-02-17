@@ -607,3 +607,350 @@ pub(crate) fn create_strategy(name: &str) -> Result<Box<dyn Strategy>, String> {
         _ => Err(format!("Unknown strategy: {}", name)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{message::PayjoinProposal, wallet::PaymentObligationData, TimeStep};
+    use bitcoin::Amount;
+
+    // Helper to create a minimal WalletView for testing
+    fn create_test_wallet_view(
+        payment_obligations: Vec<PaymentObligationData>,
+        payjoin_proposals: Vec<(MessageId, BulletinBoardId, PayjoinProposal)>,
+    ) -> WalletView {
+        WalletView::new(
+            payment_obligations,
+            payjoin_proposals,
+            vec![],
+            vec![],
+            TimeStep(0),
+            WalletId(0),
+        )
+    }
+
+    #[test]
+    fn test_unilateral_spender() {
+        let strategy = UnilateralSpender;
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+        let view = create_test_wallet_view(vec![po], vec![]);
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::UnilateralSpend(_))));
+    }
+
+    #[test]
+    fn test_batch_spender_creates_batches() {
+        let strategy = BatchSpender;
+        let po1 = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+        let po2 = PaymentObligationData {
+            id: PaymentObligationId(1),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(2000),
+            from: WalletId(0),
+            to: WalletId(2),
+        };
+        let view = create_test_wallet_view(vec![po1, po2], vec![]);
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        // BatchSpender creates a single batch with all obligations
+        assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::BatchSpend(ids) if ids.len() == 2)));
+    }
+
+    #[test]
+    fn test_payjoin_strategy() {
+        let strategy = PayjoinStrategy;
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+
+        // Test without proposals should only return InitiatePayjoin
+        let view = create_test_wallet_view(vec![po.clone()], vec![]);
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::InitiatePayjoin(_))));
+
+        // Test with proposals should return both InitiatePayjoin and RespondToPayjoin
+        let proposal = PayjoinProposal {
+            tx: crate::transaction::TxData {
+                inputs: vec![],
+                outputs: vec![],
+                wallet_acks: vec![],
+            },
+            valid_till: TimeStep(200),
+        };
+
+        let view =
+            create_test_wallet_view(vec![po], vec![(MessageId(0), BulletinBoardId(0), proposal)]);
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        assert_eq!(actions.len(), 2);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::InitiatePayjoin(_))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::RespondToPayjoin(_, _, _, _))));
+    }
+
+    #[test]
+    fn test_composite_strategy_combines_actions() {
+        let composite = CompositeStrategy {
+            strategies: vec![Box::new(UnilateralSpender), Box::new(BatchSpender)],
+        };
+
+        let po1 = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+        let po2 = PaymentObligationData {
+            id: PaymentObligationId(1),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(2000),
+            from: WalletId(0),
+            to: WalletId(2),
+        };
+        let view = create_test_wallet_view(vec![po1, po2], vec![]);
+
+        let actions = composite.enumerate_candidate_actions(&view);
+
+        // Should include actions from both strategies
+        // UnilateralSpender: 2 actions (one per obligation)
+        // BatchSpender: 1 action (batch of both)
+        assert_eq!(actions.len(), 3);
+
+        let unilateral_count = actions
+            .iter()
+            .filter(|a| matches!(a, Action::UnilateralSpend(_)))
+            .count();
+        assert_eq!(unilateral_count, 2);
+
+        let batch_count = actions
+            .iter()
+            .filter(|a| matches!(a, Action::BatchSpend(_)))
+            .count();
+        assert_eq!(batch_count, 1);
+    }
+
+    #[test]
+    fn test_multiparty_initiator_with_insufficient_receivers() {
+        let strategy = MultipartyPayjoinInitiatorStrategy;
+
+        // Only 1 unique receiver - not enough for multi-party
+        let po1 = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1), // Same receiver
+        };
+        let po2 = PaymentObligationData {
+            id: PaymentObligationId(1),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(2000),
+            from: WalletId(0),
+            to: WalletId(1), // Same receiver
+        };
+        let view = create_test_wallet_view(vec![po1, po2], vec![]);
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        // Should return Wait because we need at least 2 different receivers
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], Action::Wait));
+    }
+
+    #[test]
+    fn test_multiparty_initiator_with_multiple_receivers() {
+        let strategy = MultipartyPayjoinInitiatorStrategy;
+
+        // 2 different receivers - enough for multi-party
+        let po1 = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1), // Receiver 1
+        };
+        let po2 = PaymentObligationData {
+            id: PaymentObligationId(1),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(2000),
+            from: WalletId(0),
+            to: WalletId(2), // Receiver 2 (different)
+        };
+        let view = create_test_wallet_view(vec![po1, po2], vec![]);
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::InitiateMultiPartyPayjoin(ids) if ids.len() == 2)));
+    }
+
+    #[test]
+    fn test_multiparty_initiator_only_wallet_0() {
+        let strategy = MultipartyPayjoinInitiatorStrategy;
+
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(1), // Not wallet 0
+            to: WalletId(2),
+        };
+
+        // Create view with wallet_id = 1 (not 0)
+        let view = WalletView::new(
+            vec![po],
+            vec![],
+            vec![],
+            vec![],
+            TimeStep(0),
+            WalletId(1), // Wallet 1, not 0
+        );
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        // Should return Wait because only Wallet 0 can initiate
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], Action::Wait));
+    }
+
+    #[test]
+    fn test_multiparty_participant_with_new_invitation() {
+        let strategy = MultipartyPayjoinParticipantStrategy;
+
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+
+        // Create view with a new multi-party payjoin invitation
+        let view = WalletView::new(
+            vec![po],
+            vec![],
+            vec![(BulletinBoardId(0), MessageId(0))], // New invitation
+            vec![],                                   // No active sessions yet
+            TimeStep(0),
+            WalletId(1),
+        );
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ParticipateMultiPartyPayjoin(_))));
+    }
+
+    #[test]
+    fn test_multiparty_participant_with_active_session() {
+        let strategy = MultipartyPayjoinParticipantStrategy;
+
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+
+        // Create view with an active session
+        let view = WalletView::new(
+            vec![po],
+            vec![],
+            vec![],
+            vec![BulletinBoardId(0)], // Active session
+            TimeStep(0),
+            WalletId(1),
+        );
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ContinueParticipateMultiPartyPayjoin(_))));
+    }
+
+    #[test]
+    fn test_multiparty_participant_prefers_continue_when_invite_and_active() {
+        let strategy = MultipartyPayjoinParticipantStrategy;
+
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+
+        // With both a new invitation and active session, strategy should continue active session.
+        let view = WalletView::new(
+            vec![po],
+            vec![],
+            vec![(BulletinBoardId(0), MessageId(0))],
+            vec![BulletinBoardId(1)],
+            TimeStep(0),
+            WalletId(1),
+        );
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            actions[0],
+            Action::ContinueParticipateMultiPartyPayjoin(BulletinBoardId(1))
+        ));
+    }
+}
