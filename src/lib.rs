@@ -732,7 +732,7 @@ impl SimulationResult {
         self.total_payment_obligations
     }
 
-    pub fn precentage_of_payment_obligations_missed(&self) -> f64 {
+    pub fn percentage_of_payment_obligations_missed(&self) -> f64 {
         let total_payment_obligations = self.total_payment_obligations();
         self.missed_payment_obligations
             .iter()
@@ -786,22 +786,21 @@ mod tests {
         let result = sim.run();
         sim.assert_invariants();
 
-        println!("{}", sim);
-        result.save_tx_graph("graph.svg");
-        // Lets check the simulation state after the run
-        // Specifically how many payment obligations we're missed
-        // And how many were created in a cospend
-        println!(
-            "Total payment obligations: {}",
-            result.total_payment_obligations()
+        // Assert simulation completed successfully
+        assert!(
+            result.total_payment_obligations() > 0,
+            "Simulation should create payment obligations"
         );
-        println!(
-            "Missed payment obligations: {:?}",
-            result.missed_payment_obligations
+        assert!(
+            result.percentage_of_payment_obligations_missed() < 1.0,
+            "Not all obligations should be missed"
         );
-        println!(
-            "Missed payment obligations percentage: {:?}",
-            result.precentage_of_payment_obligations_missed()
+
+        // Assert reasonable missed percentage (adjust threshold as needed)
+        let missed_percentage = result.percentage_of_payment_obligations_missed();
+        assert!(
+            missed_percentage >= 0.0 && missed_percentage <= 1.0,
+            "Missed percentage should be between 0 and 1"
         );
     }
 
@@ -983,8 +982,33 @@ mod tests {
 
         assert!(bob.with(&sim).info().received_transactions.contains(&spend));
 
-        // TODO mine another block, check wallet utxos, et
+        // Mine another block to confirm the transaction
+        let miner_addr = alice.with_mut(&mut sim).new_address();
+        let block_bx = BroadcastSetHandleMut {
+            id: BroadcastSetId(sim.broadcast_set_data.len() - 1),
+            sim: &mut sim,
+        };
 
-        println!("{:?}", sim);
+        let _block = block_bx
+            .construct_block_template(Weight::MAX_BLOCK)
+            .mine(miner_addr, &mut sim);
+
+        sim.assert_invariants();
+
+        // Verify transaction is now confirmed and UTXOs are updated
+        assert!(alice
+            .with(&sim)
+            .info()
+            .confirmed_utxos
+            .contains(&spend.with(&sim).outpoints().nth(1).unwrap()));
+        assert!(bob
+            .with(&sim)
+            .info()
+            .confirmed_utxos
+            .contains(&spend.with(&sim).outpoints().nth(0).unwrap()));
+
+        // Verify the spend transaction is no longer unconfirmed
+        assert!(alice.with(&sim).info().unconfirmed_txos.is_empty());
+        assert!(bob.with(&sim).info().unconfirmed_txos.is_empty());
     }
 }
