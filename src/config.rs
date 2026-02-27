@@ -24,10 +24,14 @@ pub struct WalletTypeConfig {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ScorerConfig {
-    pub initiate_payjoin_utility_factor: f64,
-    pub respond_to_payjoin_utility_factor: f64,
+    /// Utility factor for privacy-enhancing actions (e.g., payjoins, mixing)
+    pub privacy_utility_factor: f64,
+    /// Utility factor for interactive protocols that require coordination
+    pub interactivity_utility_factor: f64,
+    /// Base utility factor for fulfilling payment obligations
     pub payment_obligation_utility_factor: f64,
-    pub multi_party_payjoin_utility_factor: f64,
+    /// Utility factor for multi-party coordination protocols
+    pub coordination_utility_factor: f64,
 }
 
 impl Config {

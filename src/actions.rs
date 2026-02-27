@@ -165,7 +165,7 @@ pub(crate) struct InitiateMultiPartyPayjoinOutcome {
 }
 
 impl InitiateMultiPartyPayjoinOutcome {
-    fn score(&self, multi_party_payjoin_utility_factor: f64) -> ActionScore {
+    fn score(&self, _coordination_utility_factor: f64) -> ActionScore {
         // For now the score for initiating a multi-party payjoin is really high so it always happens no matter what
         let score = self.amount_handled * 100.0;
         debug!("InitiateMultiPartyPayjoinEvent score: {:?}", score);
@@ -182,7 +182,7 @@ pub(crate) struct ParticipateMultiPartyPayjoinOutcome {
 }
 
 impl ParticipateMultiPartyPayjoinOutcome {
-    fn score(&self, multi_party_payjoin_utility_factor: f64) -> ActionScore {
+    fn score(&self, _coordination_utility_factor: f64) -> ActionScore {
         // TODO: score the participation as a linear function of the progression of the session
         let score = self.amount_handled * 100.0;
         debug!("ParticipateMultiPartyPayjoinEvent score: {:?}", score);
@@ -552,10 +552,10 @@ impl Clone for Box<dyn Strategy> {
 // TODO: this should be a trait once we have different scoring strategies
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CompositeScorer {
-    pub(crate) initiate_payjoin_utility_factor: f64,
-    pub(crate) respond_to_payjoin_utility_factor: f64,
+    pub(crate) privacy_utility_factor: f64,
+    pub(crate) interactivity_utility_factor: f64,
     pub(crate) payment_obligation_utility_factor: f64,
-    pub(crate) multi_party_payjoin_utility_factor: f64,
+    pub(crate) coordination_utility_factor: f64,
 }
 
 impl CompositeScorer {
@@ -577,16 +577,16 @@ impl CompositeScorer {
                     }
                 }
                 PredictedOutcome::InitiatePayjoin(event) => {
-                    score = score + event.score(self.initiate_payjoin_utility_factor);
+                    score = score + event.score(self.privacy_utility_factor);
                 }
                 PredictedOutcome::RespondToPayjoin(event) => {
-                    score = score + event.score(self.respond_to_payjoin_utility_factor);
+                    score = score + event.score(self.interactivity_utility_factor);
                 }
                 PredictedOutcome::InitiateMultiPartyPayjoin(event) => {
-                    score = score + event.score(self.multi_party_payjoin_utility_factor);
+                    score = score + event.score(self.coordination_utility_factor);
                 }
                 PredictedOutcome::ParticipateMultiPartyPayjoin(event) => {
-                    score = score + event.score(self.multi_party_payjoin_utility_factor);
+                    score = score + event.score(self.coordination_utility_factor);
                 }
             }
         }

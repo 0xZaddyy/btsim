@@ -8,7 +8,8 @@ name = "Payjoiner"
 count = 3
 strategies = ["UnilateralSpender", "PayjoinStrategy"]
 [wallet_types.scorer]
-initiate_payjoin_utility_factor = 2.0
-respond_to_payjoin_utility_factor = 5.0
+privacy_utility_factor = 2.0
+interactivity_utility_factor = 5.0
 payment_obligation_utility_factor = 1.0
+coordination_utility_factor = 0.0
 
