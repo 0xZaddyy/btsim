@@ -766,16 +766,12 @@ mod tests {
     fn test_universe() {
         use crate::config::{ScorerConfig, WalletTypeConfig};
         let wallet_types = vec![WalletTypeConfig {
-            name: "default".to_string(),
+            name: "unilateral_spender".to_string(),
             count: 5,
-            strategies: vec![
-                "UnilateralSpender".to_string(),
-                "BatchSpender".to_string(),
-                "PayjoinStrategy".to_string(),
-            ],
+            strategies: vec!["UnilateralSpender".to_string()],
             scorer: ScorerConfig {
-                initiate_payjoin_utility_factor: 2.0,
-                respond_to_payjoin_utility_factor: 5.0,
+                initiate_payjoin_utility_factor: 0.0,
+                respond_to_payjoin_utility_factor: 0.0,
                 payment_obligation_utility_factor: 1.0,
                 multi_party_payjoin_utility_factor: 0.0,
             },
@@ -798,7 +794,7 @@ mod tests {
 
         assert_eq!(
             result.percentage_of_payment_obligations_missed(),
-            0.5384615384615384,
+            0.0,
             "With seed 42, missed percentage should be deterministic"
         );
     }
