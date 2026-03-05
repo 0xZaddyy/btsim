@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::fs;
 
+use crate::script_type::ScriptType;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub simulation: SimulationConfig,
@@ -20,6 +22,8 @@ pub struct WalletTypeConfig {
     pub count: usize,
     pub strategies: Vec<String>,
     pub scorer: ScorerConfig,
+    #[serde(default)]
+    pub script_type: ScriptType,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

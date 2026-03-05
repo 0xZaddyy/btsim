@@ -6,6 +6,7 @@ num_payment_obligations = 15
 [[wallet_types]]
 name = "Payjoiner"
 count = 3
+script_type = "p2tr"
 strategies = ["UnilateralSpender", "PayjoinStrategy"]
 [wallet_types.scorer]
 fee_savings_weight = 1.0

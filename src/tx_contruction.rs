@@ -243,6 +243,7 @@ mod tests {
                     payment_obligation_weight: 0.0,
                     coordination_weight: 0.0,
                 },
+                script_type: crate::script_type::ScriptType::P2tr,
             }];
             SimulationBuilder::new(42, wallet_types, 10, 1, 0).build()
         }
@@ -265,6 +266,7 @@ mod tests {
                     strategies: vec![create_strategy("UnilateralSpender").unwrap()],
                 },
                 default_scorer,
+                crate::script_type::ScriptType::P2tr,
             );
             let address = wallet.with_mut(sim).new_address();
 
@@ -329,6 +331,7 @@ mod tests {
                     strategies: vec![create_strategy("UnilateralSpender").unwrap()],
                 },
                 default_scorer,
+                crate::script_type::ScriptType::P2tr,
             );
             let address = wallet.with_mut(sim).new_address();
 
