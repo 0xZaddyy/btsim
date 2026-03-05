@@ -3,8 +3,8 @@ use crate::Simulation;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::{predict_weight, InputWeightPrediction};
+use bitcoin::FeeRate;
 use bitcoin::{Amount, Weight};
-use bitcoin::{FeeRate, ScriptBuf, WitnessProgram};
 
 define_entity!(
     Tx,
@@ -111,32 +111,9 @@ pub(crate) struct Output {
     pub(crate) address_id: AddressId,
 }
 
-impl From<Output> for bitcoin::transaction::TxOut {
-    fn from(o: Output) -> Self {
-        // FIXME refactor into fn encode_as_txo(enum { AddressId, Index, Outpoint  })
-        // TODO handle multiple address types
-        let mut program = [0u8; 32];
-        // TODO tag, segregate from txos encoding indexes?
-        program[0] = o
-            .address_id
-            .0
-            .try_into()
-            .expect("TODO support more than 256 addresses");
-
-        let witness_program =
-            WitnessProgram::new(bitcoin::WitnessVersion::V1, &program[..]).unwrap();
-        let script_pubkey = ScriptBuf::new_witness_program(&witness_program);
-
-        bitcoin::transaction::TxOut {
-            value: o.amount,
-            script_pubkey,
-        }
-    }
-}
-
 impl Output {
-    fn size(&self) -> usize {
-        bitcoin::transaction::TxOut::from(*self).size()
+    fn script_pubkey_len(&self, sim: &Simulation) -> usize {
+        self.address(sim).data().script_type.output_script_len()
     }
 
     fn address<'a>(&self, sim: &'a Simulation) -> AddressHandle<'a> {
@@ -281,7 +258,7 @@ impl TxInfo {
 
         let weight = predict_weight(
             prevouts.clone().map(|i| InputWeightPrediction::from(i)),
-            tx.outputs.iter().map(|o| o.size()),
+            tx.outputs.iter().map(|o| o.script_pubkey_len(sim)),
         );
 
         // TODO separate to a different index struct

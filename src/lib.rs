@@ -25,6 +25,7 @@ use crate::{
     config::WalletTypeConfig,
     economic_graph::EconomicGraph,
     message::{MessageData, MessageId},
+    script_type::ScriptType,
     transaction::{InputId, Outpoint, TxData, TxHandle, TxId, TxInfo},
     wallet::{
         AddressData, AddressId, PaymentObligationData, PaymentObligationId, WalletData,
@@ -41,6 +42,7 @@ pub mod config;
 mod economic_graph;
 mod graphviz;
 mod message;
+pub mod script_type;
 mod transaction;
 mod tx_contruction;
 mod wallet;
@@ -290,7 +292,11 @@ impl SimulationBuilder {
                         }
                     }
                 }
-                let wallet_id = sim.new_wallet(CompositeStrategy { strategies }, scorer.clone());
+                let wallet_id = sim.new_wallet(
+                    CompositeStrategy { strategies },
+                    scorer.clone(),
+                    wallet_type.script_type,
+                );
                 sim.economic_graph.grow(wallet_id);
             }
         }
@@ -492,7 +498,12 @@ impl<'a> Simulation {
         }
     }
 
-    fn new_wallet(&mut self, strategies: CompositeStrategy, scorer: CompositeScorer) -> WalletId {
+    fn new_wallet(
+        &mut self,
+        strategies: CompositeStrategy,
+        scorer: CompositeScorer,
+        script_type: ScriptType,
+    ) -> WalletId {
         // TODO wallet_handle?
         let last_wallet_info_id = WalletInfoId(self.wallet_info.len());
         self.wallet_info.push(WalletInfo {
@@ -524,6 +535,7 @@ impl<'a> Simulation {
             messages_processed: OrdSet::<MessageId>::default(),
             strategies,
             scorer,
+            script_type,
         });
         id
     }
@@ -769,6 +781,7 @@ mod tests {
                 payment_obligation_weight: 1.0,
                 coordination_weight: 0.0,
             },
+            script_type: ScriptType::P2tr,
         }];
         let mut sim = SimulationBuilder::new(42, wallet_types, 20, 1, 10).build();
         sim.assert_invariants();
@@ -810,6 +823,7 @@ mod tests {
                 payment_obligation_weight: 1.0,
                 coordination_weight: 0.0,
             },
+            script_type: ScriptType::P2tr,
         }];
         let mut sim = SimulationBuilder::new(42, wallet_types, 20, 1, 10).build();
         sim.assert_invariants();
@@ -836,6 +850,7 @@ mod tests {
                 strategies: alice_strategies,
             },
             default_scorer.clone(),
+            ScriptType::P2tr,
         );
         sim.assert_invariants();
         let bob = sim.new_wallet(
@@ -843,6 +858,7 @@ mod tests {
                 strategies: bob_strategies,
             },
             default_scorer,
+            ScriptType::P2tr,
         );
         sim.assert_invariants();
 
@@ -893,7 +909,7 @@ mod tests {
             },
             outputs: TargetOutputs {
                 value_sum: payment.amount.to_sat(),
-                weight_sum: 34, // TODO use payment.to to derive an address, payment.into() ?
+                weight_sum: ScriptType::P2tr.output_weight_wu(),
                 n_outputs: 1,
             },
         };
@@ -928,7 +944,7 @@ mod tests {
 
         assert_eq!(spend, TxId(2));
 
-        assert_eq!(spend.with(&sim).info().weight, Weight::from_wu(688));
+        assert_eq!(spend.with(&sim).info().weight, Weight::from_wu(616));
 
         assert_eq!(
             alice.with(&sim).data().own_transactions,
@@ -999,5 +1015,67 @@ mod tests {
         // Verify the spend transaction is no longer unconfirmed
         assert!(alice.with(&sim).info().unconfirmed_txos.is_empty());
         assert!(bob.with(&sim).info().unconfirmed_txos.is_empty());
+    }
+
+    #[test]
+    fn test_weight_prediction_by_script_type() {
+        use crate::config::{ScorerConfig, WalletTypeConfig};
+        use bitcoin::transaction::{predict_weight, InputWeightPrediction};
+
+        let script_types = [ScriptType::P2tr, ScriptType::P2wpkh, ScriptType::P2pkh];
+
+        for script_type in script_types {
+            let wallet_types = vec![WalletTypeConfig {
+                name: "weight_test".to_string(),
+                count: 2,
+                strategies: vec!["UnilateralSpender".to_string()],
+                scorer: ScorerConfig {
+                    fee_savings_weight: 1.0,
+                    privacy_weight: 2.0,
+                    payment_obligation_weight: 1.0,
+                    coordination_weight: 0.0,
+                },
+                script_type,
+            }];
+
+            let mut sim = SimulationBuilder::new(42, wallet_types, 5, 1, 0).build();
+            let wallet_id = WalletId(0);
+            let funding_addr = wallet_id.with_mut(&mut sim).new_address();
+            let spend_addr = wallet_id.with_mut(&mut sim).new_address();
+
+            let funding_tx = sim.new_tx(|tx, _| {
+                tx.outputs.push(Output {
+                    amount: Amount::from_sat(1_000),
+                    address_id: funding_addr,
+                });
+            });
+
+            let spend_tx = sim.new_tx(|tx, _| {
+                tx.inputs.push(Input {
+                    outpoint: Outpoint {
+                        txid: funding_tx,
+                        index: 0,
+                    },
+                });
+                tx.outputs.push(Output {
+                    amount: Amount::from_sat(900),
+                    address_id: spend_addr,
+                });
+            });
+
+            let expected_input = match script_type {
+                ScriptType::P2tr => InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH,
+                ScriptType::P2wpkh => InputWeightPrediction::P2WPKH_MAX,
+                ScriptType::P2pkh => InputWeightPrediction::P2PKH_COMPRESSED_MAX,
+            };
+            let expected_output_len = match script_type {
+                ScriptType::P2tr => 34,
+                ScriptType::P2wpkh => 22,
+                ScriptType::P2pkh => 25,
+            };
+            let expected_weight = predict_weight([expected_input], [expected_output_len]);
+
+            assert_eq!(spend_tx.with(&sim).info().weight, expected_weight);
+        }
     }
 }

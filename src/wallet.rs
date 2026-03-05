@@ -3,6 +3,7 @@ use crate::{
     blocks::BroadcastSetId,
     bulletin_board::{BroadcastMessageType, BulletinBoardId},
     message::{MessageId, MessageType, PayjoinProposal},
+    script_type::ScriptType,
     tx_contruction::{
         MultiPartyPayjoinSession, SentBulletinBoardId, SentInputs, SentOutputs, SentReadyToSign,
         TxConstructionState,
@@ -11,7 +12,7 @@ use crate::{
 };
 use bdk_coin_select::{
     metrics::LowestFee, Candidate, ChangePolicy, CoinSelector, Drain, DrainWeights, Target,
-    TargetFee, TargetOutputs, TR_DUST_RELAY_MIN_VALUE, TR_KEYSPEND_TXIN_WEIGHT,
+    TargetFee, TargetOutputs, TR_DUST_RELAY_MIN_VALUE,
 };
 use bitcoin::{transaction::InputWeightPrediction, Amount};
 use im::{HashMap, OrdSet, Vector};
@@ -31,6 +32,7 @@ define_entity_data!(Wallet, {
     pub(crate) messages_processed: OrdSet<MessageId>,
     pub(crate) strategies: CompositeStrategy,
     pub(crate) scorer: CompositeScorer,
+    pub(crate) script_type: ScriptType,
 }, skip_eq_clone);
 define_entity_info!(Wallet, {
         pub(crate) broadcast_set_id: BroadcastSetId,
@@ -95,9 +97,9 @@ impl<'a> WalletHandle<'a> {
             .enumerate()
             .map(|(_, o)| Candidate {
                 value: o.data().amount.to_sat(),
-                weight: TR_KEYSPEND_TXIN_WEIGHT,
+                weight: o.address().data().script_type.input_weight_wu(),
                 input_count: 1,
-                is_segwit: true,
+                is_segwit: o.address().data().script_type.is_segwit(),
             })
             .collect();
 
@@ -191,9 +193,10 @@ impl<'a> WalletHandleMut<'a> {
     pub(crate) fn new_address(&mut self) -> AddressId {
         let id = AddressId(self.sim.address_data.len());
         self.sim.wallet_data[self.id.0].addresses.push(id);
-        self.sim
-            .address_data
-            .push(AddressData { wallet_id: self.id });
+        self.sim.address_data.push(AddressData {
+            wallet_id: self.id,
+            script_type: self.data().script_type,
+        });
         id
     }
 
@@ -215,6 +218,16 @@ impl<'a> WalletHandleMut<'a> {
             .iter()
             .map(|(amount, _)| amount.to_sat())
             .sum();
+        let output_weight_sum: u32 = amount_and_destination
+            .iter()
+            .map(|(_, address_id)| {
+                address_id
+                    .with(self.sim)
+                    .data()
+                    .script_type
+                    .output_weight_wu()
+            })
+            .sum();
         let target = Target {
             fee: TargetFee {
                 rate: bdk_coin_select::FeeRate::from_sat_per_vb(1.0),
@@ -222,7 +235,7 @@ impl<'a> WalletHandleMut<'a> {
             },
             outputs: TargetOutputs {
                 value_sum: amount,
-                weight_sum: 34, // TODO use payment.to to derive an address, payment.into() ?
+                weight_sum: output_weight_sum,
                 n_outputs: amount_and_destination.len(),
             },
         };
@@ -699,15 +712,14 @@ impl<'a> PaymentObligationHandle<'a> {
 
 define_entity!(Address, {
     pub(crate) wallet_id: WalletId,
-    // TODO script_type
+    pub(crate) script_type: ScriptType,
     // TODO internal
     // TODO silent payments
 }, {});
 
 impl From<AddressData> for InputWeightPrediction {
-    fn from(_: AddressData) -> Self {
-        // TODO match on script_type
-        bitcoin::transaction::InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH
+    fn from(data: AddressData) -> Self {
+        data.script_type.input_weight_prediction()
     }
 }
 
