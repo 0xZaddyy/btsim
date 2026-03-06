@@ -44,6 +44,8 @@ pub(crate) enum Action {
     UnilateralSpend(PaymentObligationId),
     /// Batch spend multiple payment obligations
     BatchSpend(Vec<PaymentObligationId>),
+    /// Pay a payment obligation while consolidating all UTXOs into change
+    ConsolidateSelf(PaymentObligationId),
     /// Initiate a payjoin with a counterparty
     InitiatePayjoin(PaymentObligationId),
     /// respond to a payjoin proposal
@@ -70,6 +72,7 @@ pub(crate) enum PredictedOutcome {
     RespondToPayjoin(RespondToPayjoinOutcome),
     InitiateMultiPartyPayjoin(InitiateMultiPartyPayjoinOutcome),
     ParticipateMultiPartyPayjoin(ParticipateMultiPartyPayjoinOutcome),
+    Consolidation(ConsolidationOutcome),
 }
 
 #[derive(Debug)]
@@ -167,6 +170,20 @@ impl ParticipateMultiPartyPayjoinOutcome {
     fn cost(&self) -> ActionCost {
         // TODO: model the participation utility as a linear function of the progression of the session
         // For now this costs nothing as testing scaffolding.
+        ActionCost(0.0)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ConsolidationOutcome {
+    /// Base cost: fee_paid in sats.
+    #[allow(dead_code)]
+    base_cost: f64,
+}
+
+impl ConsolidationOutcome {
+    fn cost(&self) -> ActionCost {
+        debug!("ConsolidationEvent cost: 0");
         ActionCost(0.0)
     }
 }
@@ -280,6 +297,12 @@ fn simulate_one_action(wallet_handle: &WalletHandleMut, action: &Action) -> Vec<
         events.push(PredictedOutcome::PaymentObligationsHandled(outcomes));
     }
 
+    if matches!(action, Action::ConsolidateSelf(_)) {
+        events.push(PredictedOutcome::Consolidation(ConsolidationOutcome {
+            base_cost: fee_paid_total,
+        }));
+    }
+
     // Check if the wallet initiated a payjoin
     let old_initiated_payjoins = old_info.initiated_payjoins;
     let new_initiated_payjoins = new_info.initiated_payjoins.clone();
@@ -290,7 +313,6 @@ fn simulate_one_action(wallet_handle: &WalletHandleMut, action: &Action) -> Vec<
     {
         let po = payment_obligation_id.with(&sim).data();
         let amount_handled = po.amount.to_float_in(bitcoin::Denomination::Satoshi);
-        let balance_difference = amount_handled * -1.0; // TODO: fee's are not factored in yet
         events.push(PredictedOutcome::InitiatePayjoin(InitiatePayjoinOutcome {
             time_left: po.deadline.0 as i32 - wallet_view.current_timestep.0 as i32,
             base_cost: fee_paid_total + amount_handled,
@@ -381,6 +403,25 @@ impl Strategy for UnilateralSpender {
             actions.push(Action::UnilateralSpend(po.id));
         }
 
+        actions
+    }
+
+    fn clone_box(&self) -> Box<dyn Strategy> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Consolidator;
+
+impl Strategy for Consolidator {
+    fn enumerate_candidate_actions(&self, state: &WalletView) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for po in state.payment_obligations.iter() {
+            actions.push(Action::UnilateralSpend(po.id));
+            actions.push(Action::ConsolidateSelf(po.id));
+        }
+        actions.push(Action::Wait);
         actions
     }
 
@@ -601,6 +642,9 @@ impl CompositeScorer {
                 PredictedOutcome::ParticipateMultiPartyPayjoin(event) => {
                     cost = cost + event.cost();
                 }
+                PredictedOutcome::Consolidation(event) => {
+                    cost = cost + event.cost();
+                }
             }
         }
         cost
@@ -611,6 +655,7 @@ impl CompositeScorer {
 pub(crate) fn create_strategy(name: &str) -> Result<Box<dyn Strategy>, String> {
     match name {
         "UnilateralSpender" => Ok(Box::new(UnilateralSpender)),
+        "Consolidator" => Ok(Box::new(Consolidator)),
         "BatchSpender" => Ok(Box::new(BatchSpender)),
         "PayjoinStrategy" => Ok(Box::new(PayjoinStrategy)),
         "MultipartyPayjoinInitiatorStrategy" => Ok(Box::new(MultipartyPayjoinInitiatorStrategy)),
@@ -658,6 +703,30 @@ mod tests {
         let actions = strategy.enumerate_candidate_actions(&view);
 
         assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::UnilateralSpend(_))));
+    }
+
+    #[test]
+    fn test_unilateral_consolidate_spender() {
+        let strategy = Consolidator;
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+        let view = WalletView::new(vec![po], vec![], vec![], vec![], TimeStep(0), WalletId(0));
+
+        let actions = strategy.enumerate_candidate_actions(&view);
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ConsolidateSelf(_))));
+        assert!(actions.iter().any(|a| matches!(a, Action::Wait)));
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::UnilateralSpend(_))));
