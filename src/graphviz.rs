@@ -7,7 +7,7 @@ use graphviz_rust::{
 };
 use im::OrdSet;
 
-use crate::{transaction::TxHandle, Simulation, SimulationResult};
+use crate::{transaction::TxHandle, Simulation};
 
 // TODO make overridable? builder pattern?
 pub fn new(name: &str) -> Graph {

@@ -32,7 +32,7 @@ where
             // connect to the first node if it exists, forming a star graph
             if let Some(i) = self.graph.node_indices().next() {
                 let j = self.graph.add_node(id);
-                self.graph.add_edge(j, i, self.rng.gen_range(0.0..1.0)); // TODO 1.0 is too high
+                self.graph.add_edge(j, i, self.rng.random_range(0.0..1.0)); // TODO 1.0 is too high
             } else {
                 self.graph.add_node(id);
             }
@@ -50,8 +50,8 @@ where
                 self.m,
                 Some(seed),
                 Some(std::mem::take(&mut self.graph)),
-                || id,                           // only used once, hopefully
-                || self.rng.gen_range(0.0..1.0), // TODO 1.0 is too high
+                || id,                              // only used once, hopefully
+                || self.rng.random_range(0.0..1.0), // TODO 1.0 is too high
             )
             .expect("attaching new node to the graph should unconditionally succeed");
         }
@@ -64,10 +64,10 @@ where
         &'a mut self,
     ) -> impl Iterator<Item = (WalletId, WalletId)> + 'a {
         self.graph.edge_indices().flat_map(|i| {
-            if self.rng.gen_bool(*self.graph.edge_weight(i).unwrap()) {
+            if self.rng.random_bool(*self.graph.edge_weight(i).unwrap()) {
                 // can default to 0.0 but this shouldn't happen
                 let (a, b) = self.graph.edge_endpoints(i).unwrap();
-                let (from, to) = if self.rng.gen_bool(0.5) {
+                let (from, to) = if self.rng.random_bool(0.5) {
                     (a, b)
                 } else {
                     (b, a)
