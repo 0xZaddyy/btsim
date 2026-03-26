@@ -46,6 +46,7 @@ impl Config {
         // Validate strategy names
         let valid_strategies = [
             "UnilateralSpender",
+            "Consolidator",
             "BatchSpender",
             "PayjoinStrategy",
             "MultipartyPayjoinInitiatorStrategy",
