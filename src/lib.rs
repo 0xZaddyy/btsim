@@ -1124,7 +1124,7 @@ mod tests {
                 let (inputs, drain) =
                     alice
                         .with(&sim)
-                        .select_coins(target, long_term_feerate, false);
+                        .select_coins(target, long_term_feerate, false, None);
 
                 tx.inputs = inputs
                     .map(|o| Input {
