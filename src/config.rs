@@ -20,10 +20,13 @@ pub struct SimulationConfig {
 pub struct WalletTypeConfig {
     pub name: String,
     pub count: usize,
+    #[serde(default)]
     pub strategies: Vec<String>,
     pub scorer: ScorerConfig,
     #[serde(default)]
     pub script_type: ScriptType,
+    #[serde(default)]
+    pub is_miner: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

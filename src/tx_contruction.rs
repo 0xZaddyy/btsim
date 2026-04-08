@@ -244,6 +244,7 @@ mod tests {
                     coordination_weight: 0.0,
                 },
                 script_type: crate::script_type::ScriptType::P2tr,
+                is_miner: false,
             }];
             SimulationBuilder::new(42, wallet_types, 10, 1, 0).build()
         }
@@ -267,6 +268,7 @@ mod tests {
                 },
                 default_scorer,
                 crate::script_type::ScriptType::P2tr,
+                false, // not a miner
             );
             let address = wallet.with_mut(sim).new_address();
 
@@ -328,6 +330,7 @@ mod tests {
                 },
                 default_scorer,
                 crate::script_type::ScriptType::P2tr,
+                false, // not a miner
             );
             let address = wallet.with_mut(sim).new_address();
 

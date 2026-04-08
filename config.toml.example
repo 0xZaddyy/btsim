@@ -4,7 +4,18 @@ max_timestep = 10
 num_payment_obligations = 15
 
 [[wallet_types]]
-name = "default"
+name = "Miner"
+count = 1
+is_miner = true
+script_type = "p2tr"
+[wallet_types.scorer]
+fee_savings_weight = 0.0
+privacy_weight = 0.0
+payment_obligation_weight = 0.0
+coordination_weight = 0.0
+
+[[wallet_types]]
+name = "Payjoiner"
 count = 3
 script_type = "p2tr"
 strategies = ["UnilateralSpender", "BatchSpender"]

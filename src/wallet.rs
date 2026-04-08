@@ -33,6 +33,7 @@ define_entity_data!(Wallet, {
     pub(crate) strategies: CompositeStrategy,
     pub(crate) scorer: CompositeScorer,
     pub(crate) script_type: ScriptType,
+    pub(crate) is_miner: bool,
 }, skip_eq_clone);
 define_entity_info!(Wallet, {
         pub(crate) broadcast_set_id: BroadcastSetId,

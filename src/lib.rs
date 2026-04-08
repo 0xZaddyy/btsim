@@ -297,8 +297,12 @@ impl SimulationBuilder {
                     CompositeStrategy { strategies },
                     scorer.clone(),
                     wallet_type.script_type,
+                    wallet_type.is_miner,
                 );
-                sim.economic_graph.grow(wallet_id);
+                // Only add non-miners to the economic graph so they participate in payments
+                if !wallet_type.is_miner {
+                    sim.economic_graph.grow(wallet_id);
+                }
             }
         }
 
@@ -354,10 +358,17 @@ impl<'a> Simulation {
             .map(|&id| id.with_mut(self).new_address())
             .collect::<Vec<_>>();
 
-        // For now we just mine a coinbase transaction for each wallet
+        // Mine initial coinbase transactions
         let mut i = 0;
-        for address in addresses.iter() {
-            for _ in 0..prng.gen_range(5..10) {
+        for (wallet_id, address) in wallet_ids.iter().zip(addresses.iter()) {
+            let wallet_data = &self.wallet_data[wallet_id.0];
+            let num_blocks = if wallet_data.is_miner {
+                prng.random_range(3..5)
+            } else {
+                prng.random_range(10..15)
+            };
+
+            for _ in 0..num_blocks {
                 let _ = BroadcastSetHandleMut {
                     id: BroadcastSetId(i),
                     sim: self,
@@ -388,7 +399,12 @@ impl<'a> Simulation {
     }
 
     fn tick(&mut self) {
-        let wallet_ids = self.wallet_data.iter().map(|w| w.id).collect::<Vec<_>>();
+        let wallet_ids: Vec<_> = self
+            .wallet_data
+            .iter()
+            .filter(|w| !w.is_miner)
+            .map(|w| w.id)
+            .collect();
         for wallet_id in wallet_ids.iter() {
             wallet_id.with_mut(self).wake_up();
         }
@@ -409,9 +425,8 @@ impl<'a> Simulation {
         BlockId(0)
     }
 
-    fn miner_address(&mut self) -> AddressId {
-        let miner = self.wallet_data[0].id;
-        miner.with_mut(self).new_address()
+    fn miner_address(&self) -> AddressId {
+        AddressId(0)
     }
 
     fn create_bulletin_board(&mut self) -> BulletinBoardId {
@@ -462,7 +477,7 @@ impl<'a> Simulation {
                 debug_assert!(from != to, "circular payment obligation");
                 // TODO: should be a configurable or dependent on the balance of each wallet?
                 let reveal_time =
-                    prng.gen_range(current_timestep + 1..self.config.max_timestep.0 / 2); // Payments shouldnt be revealed too late. Aim to have them revealed within the first half of the simulation.
+                    prng.random_range(current_timestep + 1..self.config.max_timestep.0 / 2); // Payments shouldnt be revealed too late. Aim to have them revealed within the first half of the simulation.
                 let deadline = reveal_time
                     + std::cmp::min(
                         self.config.max_timestep.0,
@@ -504,6 +519,7 @@ impl<'a> Simulation {
         strategies: CompositeStrategy,
         scorer: CompositeScorer,
         script_type: ScriptType,
+        is_miner: bool,
     ) -> WalletId {
         // TODO wallet_handle?
         let last_wallet_info_id = WalletInfoId(self.wallet_info.len());
@@ -534,6 +550,7 @@ impl<'a> Simulation {
             strategies,
             scorer,
             script_type,
+            is_miner,
         });
         id
     }
@@ -957,6 +974,7 @@ mod tests {
                 coordination_weight: 0.0,
             },
             script_type: ScriptType::P2tr,
+            is_miner: false,
         }];
         let mut sim = SimulationBuilder::new(42, wallet_types, 20, 1, 10).build();
         sim.assert_invariants();
@@ -999,6 +1017,7 @@ mod tests {
                 coordination_weight: 0.0,
             },
             script_type: ScriptType::P2tr,
+            is_miner: false,
         }];
         let mut sim = SimulationBuilder::new(42, wallet_types, 20, 1, 10).build();
         sim.assert_invariants();
@@ -1024,6 +1043,7 @@ mod tests {
             },
             default_scorer.clone(),
             ScriptType::P2tr,
+            false, // not a miner
         );
         sim.assert_invariants();
         let bob = sim.new_wallet(
@@ -1032,6 +1052,7 @@ mod tests {
             },
             default_scorer,
             ScriptType::P2tr,
+            false, // not a miner
         );
         sim.assert_invariants();
 
@@ -1209,6 +1230,7 @@ mod tests {
                     coordination_weight: 0.0,
                 },
                 script_type,
+                is_miner: false,
             }];
 
             let mut sim = SimulationBuilder::new(42, wallet_types, 5, 1, 0).build();
@@ -1268,6 +1290,7 @@ mod tests {
                     coordination_weight: 0.0,
                 },
                 script_type: ScriptType::P2tr,
+                is_miner: false,
             },
             WalletTypeConfig {
                 name: "receiver".to_string(),
@@ -1280,6 +1303,7 @@ mod tests {
                     coordination_weight: 0.0,
                 },
                 script_type: ScriptType::P2tr,
+                is_miner: false,
             },
         ];
 
