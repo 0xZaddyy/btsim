@@ -51,7 +51,6 @@ define_entity_info!(Wallet, {
         /// Set of multi-party payjoin sessions that this wallet is participating in
         pub(crate) active_multi_party_payjoins: HashMap<BulletinBoardId, MultiPartyPayjoinSession>,
         /// UTXOs registered in the order book by this wallet
-        // TODO: this should be moved to wallet data
         pub(crate) registered_inputs: OrdSet<Outpoint>,
     }
 );
@@ -439,11 +438,19 @@ impl<'a> WalletHandleMut<'a> {
         if self.info().registered_inputs.contains(outpoint) {
             return;
         }
-        self.info_mut().registered_inputs.insert(*outpoint);
+        let mut latest_info = self.info().clone();
+        latest_info.registered_inputs.insert(*outpoint);
+        self.update_info(latest_info);
         info!(
             "Wallet {:?} registered input {:?} in order book",
             self.id, outpoint
         );
+    }
+
+    pub(crate) fn update_info(&mut self, info: WalletInfo) {
+        let id = WalletInfoId(self.sim.wallet_info.len());
+        self.sim.wallet_info.push(info);
+        self.data_mut().last_wallet_info_id = id;
     }
 
     pub(crate) fn do_action(&'a mut self, action: &Action) {
