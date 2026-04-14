@@ -10,6 +10,7 @@ macro_rules! define_entity_id_and_handle {
             /// Ephemeral view into primary and second information of $base.
             #[derive(Debug, Clone, Copy)]
             pub(crate) struct [<$base Handle>]<'a> {
+                #[allow(dead_code)]
                 sim: &'a crate::Simulation,
                 pub(crate) id: [<$base Id>],
             }
@@ -17,6 +18,7 @@ macro_rules! define_entity_id_and_handle {
             impl<'a> [<$base Id>] {
                 /// Borrow the simulation, reifying the id to a [<$base Handle>]
                 /// for read access to entity.
+                #[allow(dead_code)]
                 pub(crate) fn with(&self, sim: &'a crate::Simulation) -> [<$base Handle>]<'a>
                 {
                     [<$base Handle>]::new(sim, *self)
@@ -24,6 +26,7 @@ macro_rules! define_entity_id_and_handle {
             }
 
             impl<'a> [<$base Handle>]<'a> {
+                #[allow(dead_code)]
                 pub(crate) fn new(sim: &'a crate::Simulation, id: [<$base Id>]) -> Self {
                     Self { sim, id }
                 }
@@ -70,6 +73,7 @@ macro_rules! define_entity_info {
         paste::paste! {
             /// Secondary (derived) information associated with $base.
             #[derive(Debug, PartialEq, Eq, Clone)]
+            #[allow(dead_code)]
             pub(crate) struct [<$base Info>] $info_fields
         }
     };
@@ -93,17 +97,20 @@ macro_rules! define_entity_handle_mut {
         paste::paste! {
             #[derive(Debug)]
             pub(crate) struct [<$base HandleMut>]<'a> {
+                #[allow(dead_code)]
                 pub(crate) sim: &'a mut crate::Simulation,
                 pub(crate) id: [<$base Id>],
             }
 
             impl<'a> [<$base Id>] {
+                #[allow(dead_code)]
                 pub(crate) fn with_mut(&self, sim: &'a mut crate::Simulation) -> [<$base HandleMut>]<'a> {
                     [<$base HandleMut>]::new(sim, *self)
                 }
             }
 
             impl<'a> [<$base HandleMut>]<'a> {
+                #[allow(dead_code)]
                 fn new(sim: &'a mut crate::Simulation, id: [<$base Id>]) -> Self {
                     Self { sim, id }
                 }
