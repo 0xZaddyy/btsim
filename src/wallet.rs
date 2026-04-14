@@ -2,19 +2,17 @@ use crate::{
     actions::{Action, CompositeScorer, CompositeStrategy, WalletView},
     blocks::BroadcastSetId,
     bulletin_board::BulletinBoardId,
+    cospend::UtxoWithMetadata,
     message::{MessageId, MessageType},
     script_type::ScriptType,
-    tx_contruction::{
-        MultiPartyPayjoinSession, SentBulletinBoardId, SentInputs, SentOutputs, SentReadyToSign,
-        TxConstructionState,
-    },
-    Simulation, TimeStep,
+    tx_contruction::{MultiPartyPayjoinSession, SentOutputs, SentReadyToSign, TxConstructionState},
+    CoinSelectionStrategy, Simulation, TimeStep,
 };
 use bdk_coin_select::{
     metrics::LowestFee, Candidate, ChangePolicy, CoinSelector, Drain, DrainWeights, Target,
     TargetFee, TargetOutputs, TR_DUST_RELAY_MIN_VALUE,
 };
-use bitcoin::{transaction::predict_weight, transaction::InputWeightPrediction, Amount};
+use bitcoin::{transaction::InputWeightPrediction, Amount};
 use im::{HashMap, OrdSet, Vector};
 use log::{info, warn};
 
@@ -52,6 +50,8 @@ define_entity_info!(Wallet, {
         pub(crate) handled_payment_obligations: OrdSet<PaymentObligationId>,
         /// Set of multi-party payjoin sessions that this wallet is participating in
         pub(crate) active_multi_party_payjoins: HashMap<BulletinBoardId, MultiPartyPayjoinSession>,
+        /// UTXOs registered in the order book by this wallet
+        pub(crate) registered_inputs: OrdSet<Outpoint>,
     }
 );
 
@@ -79,10 +79,18 @@ impl<'a> WalletHandle<'a> {
         &self,
         target: Target,
         long_term_feerate: bitcoin::FeeRate,
+        select_all: bool,
+        required_inputs: Option<&[Outpoint]>,
     ) -> (impl Iterator<Item = OutputHandle<'a>>, Drain) {
         // TODO change
         // TODO group by address
-        let utxos: Vec<OutputHandle<'a>> = self.unspent_coins().collect();
+        let utxos: Vec<OutputHandle<'a>> = match required_inputs {
+            Some(required) => self
+                .unspent_coins()
+                .filter(|o| required.contains(&o.outpoint()))
+                .collect(),
+            None => self.unspent_coins().collect(),
+        };
 
         let candidates: Vec<Candidate> = utxos
             .iter()
@@ -95,6 +103,9 @@ impl<'a> WalletHandle<'a> {
             .collect();
 
         let mut coin_selector = CoinSelector::new(&candidates);
+        if select_all {
+            coin_selector.select_all();
+        }
         let drain_weights = DrainWeights::default();
 
         let dust_limit = TR_DUST_RELAY_MIN_VALUE;
@@ -186,6 +197,8 @@ impl<'a> WalletHandleMut<'a> {
         &mut self,
         payment_obligation_ids: &[PaymentObligationId],
         change_addr: &AddressId,
+        select_all: bool,
+        required_inputs: Option<&[Outpoint]>,
     ) -> TxData {
         let mut amount_and_destination = vec![];
         for payment_obligation_id in payment_obligation_ids.iter() {
@@ -222,7 +235,9 @@ impl<'a> WalletHandleMut<'a> {
         };
         let long_term_feerate = bitcoin::FeeRate::from_sat_per_vb(10).expect("valid fee rate");
 
-        let (selected_coins, drain) = self.handle().select_coins(target, long_term_feerate);
+        let (selected_coins, drain) =
+            self.handle()
+                .select_coins(target, long_term_feerate, select_all, required_inputs);
         let mut tx = TxData::default();
         let mut outputs = vec![];
         for (amount, address_id) in amount_and_destination.iter() {
@@ -244,38 +259,6 @@ impl<'a> WalletHandleMut<'a> {
         tx
     }
 
-    fn create_multi_party_payjoin_session(&mut self, po_ids: &[PaymentObligationId]) {
-        if self.id.0 != 0 {
-            return; // TODO For now the first wallet is the leader
-        }
-        // First we create the bulletin board
-        let bulletin_board_id = self.sim.create_bulletin_board();
-        // Then we invite all members to join
-        for po_id in po_ids.iter() {
-            let recv = po_id.with(self.sim).data().to;
-            self.sim.broadcast_message(
-                recv,
-                self.id,
-                MessageType::InitiateMultiPartyPayjoin(bulletin_board_id),
-            );
-        }
-        let change_addr = self.new_address();
-        let tx_template = self.construct_transaction_template(po_ids, &change_addr);
-        let session = SentBulletinBoardId::new(self.sim, bulletin_board_id, tx_template.clone());
-
-        session.send_inputs();
-        info!("Sent inputs for multi party payjoin session");
-
-        let session = MultiPartyPayjoinSession {
-            payment_obligation_ids: po_ids.to_owned(),
-            tx_template,
-            state: TxConstructionState::SentInputs,
-        };
-        self.info_mut()
-            .active_multi_party_payjoins
-            .insert(bulletin_board_id, session);
-    }
-
     fn participate_in_multi_party_payjoin(&mut self, bulletin_board_id: &BulletinBoardId) {
         let session = self
             .info()
@@ -290,40 +273,24 @@ impl<'a> WalletHandleMut<'a> {
             state
         );
         match state {
-            TxConstructionState::SentBulletinBoardId => {
-                let t = SentBulletinBoardId::new(
-                    self.sim,
-                    *bulletin_board_id,
-                    session.tx_template.clone(),
-                );
-                t.send_inputs();
-                let mut updated_session = session.clone();
-                updated_session.state = TxConstructionState::SentInputs;
-                self.info_mut()
-                    .active_multi_party_payjoins
-                    .insert(*bulletin_board_id, updated_session);
+            TxConstructionState::AcceptedProposal => {
+                // Outputs are contributed via ContributeOutputsToSession; nothing to do here.
                 log::info!(
-                    "Sent inputs for multi party payjoin session with bulletin board id: {:?}",
+                    "wallet id: {:?} in AcceptedProposal state for bb {:?}, waiting for ContributeOutputsToSession",
+                    self.id,
                     bulletin_board_id
                 );
             }
-            TxConstructionState::SentInputs => {
-                let t = SentInputs::new(self.sim, *bulletin_board_id, session.tx_template.clone());
-                let res = t.have_enough_inputs();
-                if res.is_some() {
-                    let mut updated_session = session.clone();
-                    updated_session.state = TxConstructionState::SentOutputs;
-                    self.info_mut()
-                        .active_multi_party_payjoins
-                        .insert(*bulletin_board_id, updated_session);
-                    log::info!(
-                        "Sent outputs for multi party payjoin session with bulletin board id: {:?}",
-                        bulletin_board_id
-                    );
-                }
-            }
             TxConstructionState::SentOutputs => {
-                let t = SentOutputs::new(self.sim, *bulletin_board_id, session.tx_template.clone());
+                let inputs = session.inputs.clone();
+                let t = SentOutputs::new(
+                    self.sim,
+                    *bulletin_board_id,
+                    TxData {
+                        inputs,
+                        outputs: vec![],
+                    },
+                );
                 let res = t.have_enough_outputs();
                 if res.is_some() {
                     let mut updated_session = session.clone();
@@ -341,18 +308,32 @@ impl<'a> WalletHandleMut<'a> {
                 let t = SentReadyToSign::new(self.sim, *bulletin_board_id);
                 let res = t.have_enough_ready_to_sign();
                 if let Some(tx) = res {
-                    // TODO: only the leader should broadcast the tx right now
-                    if self.id.0 != 0 {
-                        return;
-                    }
-                    println!("tx: {:?}", tx);
-                    let tx_id = self.spend_tx(tx);
-                    log::info!(
-                        "Multi party payjoin session successful with bulletin board id: {:?}",
-                        bulletin_board_id
-                    );
-                    self.broadcast(std::iter::once(tx_id));
-                    // Update session state to success
+                    // Only the participant with the lowest wallet ID broadcasts to avoid
+                    // duplicate transactions (new_tx deduplicates by content, so all
+                    // participants would get the same TxId, violating broadcast/received invariants).
+                    let min_participant_id = self.sim.bulletin_boards[bulletin_board_id.0]
+                        .messages
+                        .iter()
+                        .filter_map(|msg| match msg {
+                            crate::bulletin_board::BroadcastMessageType::ContributeInputs(op) => {
+                                Some(op.with(self.sim).wallet().id)
+                            }
+                            _ => None,
+                        })
+                        .min();
+                    let is_broadcaster = min_participant_id == Some(self.id);
+
+                    let tx_id = if is_broadcaster {
+                        let id = self.spend_tx(tx);
+                        self.broadcast(std::iter::once(id));
+                        let po_ids = session.payment_obligation_ids.clone();
+                        self.info_mut()
+                            .txid_to_payment_obligation_ids
+                            .insert(id, po_ids);
+                        Some(id)
+                    } else {
+                        None
+                    };
                     let mut updated_session = session.clone();
                     updated_session.state = TxConstructionState::Success(tx_id);
                     self.info_mut()
@@ -380,24 +361,24 @@ impl<'a> WalletHandleMut<'a> {
             .cloned()
             .collect::<Vec<_>>();
         let wallet_info = self.info();
-        // New multi party payjoin sessions
-        let new_multi_party_payjoins = messages
+        // New cospend proposals
+        let new_cospend_proposals = messages
             .iter()
             .filter_map(|message| match &message.message {
-                MessageType::InitiateMultiPartyPayjoin(bulletin_board_id) => {
+                MessageType::ProposeCoSpend(bulletin_board_id) => {
                     Some((*bulletin_board_id, message.id))
                 }
+                MessageType::RegisterWalletInput(_) => None,
             })
             .collect::<Vec<_>>();
-        // Already active multi party payjoin sessions
+        // Already active multi party payjoin sessions (AcceptedProposal handled via ContributeOutputsToSession)
         let active_mp_pj_sessions = wallet_info
             .active_multi_party_payjoins
             .iter()
             .filter_map(|(bulletin_board_id, session)| match &session.state {
-                TxConstructionState::SentBulletinBoardId
-                | TxConstructionState::SentInputs
-                | TxConstructionState::SentOutputs
-                | TxConstructionState::SentReadyToSign => Some(*bulletin_board_id),
+                TxConstructionState::SentOutputs | TxConstructionState::SentReadyToSign => {
+                    Some(*bulletin_board_id)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -407,57 +388,198 @@ impl<'a> WalletHandleMut<'a> {
             .clone()
             .iter()
             .filter(|po_id| !wallet_info.handled_payment_obligations.contains(po_id))
+            // Do not offer paying again while a tx for this PO is already in the mempool;
+            // handled_payment_obligations only updates on confirm, so without this the wallet
+            // could build another tx reusing the same inputs (double-spend in `spends`).
+            .filter(|po_id| {
+                !wallet_info
+                    .txid_to_payment_obligation_ids
+                    .iter()
+                    .any(|(txid, po_ids)| {
+                        wallet_info.unconfirmed_transactions.contains(txid)
+                            && po_ids.contains(po_id)
+                    })
+            })
+            // Filter out POs that are not revealed yet
             .filter(|po| po.with(self.sim).data().reveal_time <= self.sim.current_timestep)
             .map(|po| po.with(self.sim).data().clone())
             .collect::<Vec<_>>();
+
+        let utxos = self
+            .handle()
+            .unspent_coins()
+            .map(|o| UtxoWithMetadata {
+                outpoint: o.outpoint(),
+                amount: o.data().amount,
+                owner: self.id,
+            })
+            .collect::<Vec<_>>();
+        let registered_inputs = self
+            .info()
+            .registered_inputs
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let orderbook_utxos = self.sim.get_orderbook_utxos();
+        let pending_interests = self.sim.cospend_interests.clone();
+
         WalletView::new(
             payment_obligations,
-            new_multi_party_payjoins,
+            new_cospend_proposals,
             active_mp_pj_sessions,
-            self.sim.current_timestep,
-            self.id,
+            utxos,
+            registered_inputs,
+            orderbook_utxos,
+            pending_interests,
         )
+    }
+
+    fn register_input(&mut self, outpoint: &Outpoint) {
+        if self.info().registered_inputs.contains(outpoint) {
+            return;
+        }
+        let mut latest_info = self.info().clone();
+        latest_info.registered_inputs.insert(*outpoint);
+        self.update_info(latest_info);
+        info!(
+            "Wallet {:?} registered input {:?} in order book",
+            self.id, outpoint
+        );
+    }
+
+    pub(crate) fn update_info(&mut self, info: WalletInfo) {
+        let id = WalletInfoId(self.sim.wallet_info.len());
+        self.sim.wallet_info.push(info);
+        self.data_mut().last_wallet_info_id = id;
     }
 
     pub(crate) fn do_action(&'a mut self, action: &Action) {
         match action {
             Action::Wait => {}
-            Action::UnilateralSpend(po) => {
-                self.handle_payment_obligations(&[*po]);
+            // TODO: the next 3 actions can be folded into one spend action, param'd off # of po's and coin selection strategy. All of them are unilateral
+            Action::UnilateralPayments(po_ids, coin_selection_strategy) => {
+                self.handle_payment_obligations(
+                    po_ids,
+                    matches!(coin_selection_strategy, CoinSelectionStrategy::SpendAll),
+                );
             }
-            Action::BatchSpend(po_ids) => {
-                self.handle_payment_obligations(po_ids);
-            }
-            Action::ConsolidateSelf(payment_obligation_id) => {
-                self.consolidate_self(payment_obligation_id);
-            }
-            Action::InitiateMultiPartyPayjoin(po_ids) => {
-                self.create_multi_party_payjoin_session(po_ids);
-            }
-            Action::ParticipateMultiPartyPayjoin((
-                message_id,
-                bulletin_board_id,
-                payment_obligation_id,
-            )) => {
-                // Create new session -- assuming this doesnt exist already
-                let change_addr = self.new_address();
-                let tx_template =
-                    self.construct_transaction_template(&[*payment_obligation_id], &change_addr);
+            Action::AcceptCospendProposal((message_id, bulletin_board_id)) => {
+                // Aggregator already pre-filled all inputs on the bulletin board.
+                // Find our own inputs from the bulletin board's ContributeInputs messages.
+                use crate::bulletin_board::BroadcastMessageType;
+                let my_inputs: Vec<Input> = self.sim.bulletin_boards[bulletin_board_id.0]
+                    .messages
+                    .iter()
+                    .filter_map(|msg| match msg {
+                        BroadcastMessageType::ContributeInputs(op) => Some(op),
+                        _ => None,
+                    })
+                    .filter(|op| {
+                        self.info().confirmed_utxos.contains(op)
+                            && !self.info().unconfirmed_spends.contains(op)
+                    })
+                    .map(|op| Input { outpoint: *op })
+                    .collect();
                 self.info_mut().active_multi_party_payjoins.insert(
                     *bulletin_board_id,
                     MultiPartyPayjoinSession {
-                        payment_obligation_ids: vec![*payment_obligation_id],
-                        tx_template,
-                        // TODO: better state for someone who has not started the session yet
-                        state: TxConstructionState::SentBulletinBoardId,
+                        payment_obligation_ids: vec![],
+                        inputs: my_inputs,
+                        state: TxConstructionState::AcceptedProposal,
                     },
                 );
-                // Mark message as processed
                 self.data_mut().messages_processed.insert(*message_id);
+            }
+            Action::ProposeCospend(interests) => {
+                for interest in interests {
+                    self.sim.cospend_interests.push(interest.clone());
+                }
+            }
+            Action::CreateAggregateProposal(interests) => {
+                let bb_id = self.sim.create_bulletin_board();
+                // Collect unique (outpoint, owner) pairs to avoid double-spending
+                // when multiple interests share the same UTXO (e.g. taker proposes
+                // the same UTXO against multiple makers).
+                let mut seen_outpoints = std::collections::HashSet::new();
+                let unique_utxos: Vec<_> = interests
+                    .iter()
+                    .flat_map(|i| i.utxos.iter())
+                    .filter(|u| seen_outpoints.insert(u.outpoint))
+                    // Skip UTXOs that have been spent since the interest was recorded.
+                    // Interests are non-committal and may go stale between proposal and
+                    // aggregation (e.g. the owner spent the coin unilaterally in the same
+                    // tick before the aggregator ran).
+                    .filter(|u| {
+                        let info = &self.sim.wallet_info
+                            [self.sim.wallet_data[u.owner.0].last_wallet_info_id.0];
+                        info.confirmed_utxos.contains(&u.outpoint)
+                            && !info.unconfirmed_spends.contains(&u.outpoint)
+                    })
+                    .collect();
+                // Pre-fill all unique inputs on the bulletin board
+                for u in &unique_utxos {
+                    self.sim.add_message_to_bulletin_board(
+                        bb_id,
+                        crate::bulletin_board::BroadcastMessageType::ContributeInputs(u.outpoint),
+                    );
+                }
+                // Invite each unique participant once
+                let mut invited = std::collections::HashSet::new();
+                for u in &unique_utxos {
+                    if invited.insert(u.owner) {
+                        self.sim.broadcast_message(
+                            u.owner,
+                            self.id,
+                            MessageType::ProposeCoSpend(bb_id),
+                        );
+                    }
+                }
+                // Clear the handled interests
+                self.sim
+                    .cospend_interests
+                    .retain(|i| !interests.contains(i));
+            }
+            Action::ContributeOutputsToSession(bulletin_board_id, po_ids) => {
+                let session_inputs = self
+                    .info()
+                    .active_multi_party_payjoins
+                    .get(bulletin_board_id)
+                    .unwrap()
+                    .inputs
+                    .clone();
+                let input_outpoints: Vec<Outpoint> =
+                    session_inputs.iter().map(|i| i.outpoint).collect();
+                let required = if input_outpoints.is_empty() {
+                    None
+                } else {
+                    Some(input_outpoints.as_slice())
+                };
+                let change_addr = self.new_address();
+                let full_template =
+                    self.construct_transaction_template(po_ids, &change_addr, false, required);
+                // Inputs are already pre-filled by the aggregator; broadcast our outputs directly.
+                use crate::bulletin_board::BroadcastMessageType;
+                for output in full_template.outputs.iter() {
+                    self.sim.add_message_to_bulletin_board(
+                        *bulletin_board_id,
+                        BroadcastMessageType::ContributeOutputs(output.clone()),
+                    );
+                }
+                let session = self
+                    .info_mut()
+                    .active_multi_party_payjoins
+                    .get_mut(bulletin_board_id)
+                    .unwrap();
+                session.payment_obligation_ids = po_ids.clone();
+                session.state = TxConstructionState::SentOutputs;
+            }
+            Action::ContinueParticipateInCospend(bulletin_board_id) => {
                 self.participate_in_multi_party_payjoin(bulletin_board_id);
             }
-            Action::ContinueParticipateMultiPartyPayjoin(bulletin_board_id) => {
-                self.participate_in_multi_party_payjoin(bulletin_board_id);
+            Action::RegisterInput(outpoints) => {
+                for outpoint in outpoints {
+                    self.register_input(&outpoint);
+                }
             }
         }
     }
@@ -465,9 +587,12 @@ impl<'a> WalletHandleMut<'a> {
     pub(crate) fn wake_up(&'a mut self) {
         let scorer = &self.data().scorer;
         let wallet_view = self.wallet_view();
+        // Clone strategies to allow passing &self to enumerate_candidate_actions
+        // without conflicting with the borrow on strategies.strategies
+        let strategies = self.data().strategies.clone();
         let mut all_actions = Vec::new();
-        for strategy in self.data().strategies.strategies.iter() {
-            all_actions.extend(strategy.enumerate_candidate_actions(&wallet_view));
+        for strategy in strategies.strategies.iter() {
+            all_actions.extend(strategy.enumerate_candidate_actions(&wallet_view, self));
         }
 
         let action = all_actions
@@ -478,84 +603,23 @@ impl<'a> WalletHandleMut<'a> {
         self.do_action(&action);
     }
 
-    fn handle_payment_obligations(&'a mut self, payment_obligation_ids: &[PaymentObligationId]) {
+    fn handle_payment_obligations(
+        &'a mut self,
+        payment_obligation_ids: &[PaymentObligationId],
+        select_all_utxos: bool,
+    ) {
         let change_addr = self.new_address();
-        let tx_template = self.construct_transaction_template(payment_obligation_ids, &change_addr);
+        let tx_template = self.construct_transaction_template(
+            payment_obligation_ids,
+            &change_addr,
+            select_all_utxos,
+            None,
+        );
         let tx_id = self.spend_tx(tx_template);
         self.info_mut()
             .txid_to_payment_obligation_ids
             .insert(tx_id, payment_obligation_ids.to_vec());
         self.broadcast(vec![tx_id]);
-    }
-
-    fn consolidate_self(&'a mut self, payment_obligation_id: &PaymentObligationId) {
-        let outpoints = self
-            .handle()
-            .unspent_coins()
-            .map(|o| o.outpoint())
-            .collect::<Vec<_>>();
-
-        if outpoints.len() <= 1 {
-            return;
-        }
-
-        let payment_obligation = payment_obligation_id.with(self.sim).data().clone();
-        let total_input: Amount = outpoints
-            .iter()
-            .map(|outpoint| OutputHandle::new(self.sim, *outpoint).data().amount)
-            .sum();
-
-        let payment_output_script_len = payment_obligation
-            .to
-            .with(self.sim)
-            .data()
-            .script_type
-            .output_script_len();
-        let change_output_script_len = self.data().script_type.output_script_len();
-        let weight = predict_weight(
-            outpoints.iter().map(|outpoint| {
-                InputWeightPrediction::from(OutputHandle::new(self.sim, *outpoint))
-            }),
-            [payment_output_script_len, change_output_script_len],
-        );
-        let fee_rate_sat_per_vb = 1u64;
-        let vbytes = (weight.to_wu() + 3) / 4;
-        let fee_sat = vbytes.saturating_mul(fee_rate_sat_per_vb);
-
-        if total_input.to_sat() <= payment_obligation.amount.to_sat() + fee_sat {
-            return;
-        }
-
-        let change_value = total_input.to_sat() - payment_obligation.amount.to_sat() - fee_sat;
-        if change_value < TR_DUST_RELAY_MIN_VALUE {
-            return;
-        }
-
-        let destination = self.new_address();
-        let payment_address = payment_obligation.to.with_mut(self.sim).new_address();
-        let mut tx = TxData::default();
-        tx.inputs = outpoints
-            .iter()
-            .map(|outpoint| Input {
-                outpoint: *outpoint,
-            })
-            .collect();
-        tx.outputs = vec![
-            Output {
-                amount: payment_obligation.amount,
-                address_id: payment_address,
-            },
-            Output {
-                amount: Amount::from_sat(change_value),
-                address_id: destination,
-            },
-        ];
-
-        let tx_id = self.spend_tx(tx);
-        self.info_mut()
-            .txid_to_payment_obligation_ids
-            .insert(tx_id, vec![*payment_obligation_id]);
-        self.broadcast(std::iter::once(tx_id));
     }
 
     // TODO: refactor this? Do we event need this?

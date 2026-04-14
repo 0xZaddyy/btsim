@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::bulletin_board::BroadcastMessageType;
 use crate::bulletin_board::BulletinBoardData;
 use crate::bulletin_board::BulletinBoardId;
+use crate::cospend::{CospendInterest, UtxoWithMetadata};
 use crate::message::MessageType;
 use crate::tx_contruction::MultiPartyPayjoinSession;
 use crate::{
@@ -40,6 +41,7 @@ mod actions;
 mod blocks;
 mod bulletin_board;
 pub mod config;
+mod cospend;
 mod economic_graph;
 mod graphviz;
 mod message;
@@ -65,6 +67,7 @@ impl PrngFactory {
 // TODO use bitcoin::transaction::predict_weight(inputs: IntoIter<InputWeightPrediction>, output_lengths: IntoIter<u64>)
 
 // all have RBF and non-RBF variants?
+#[derive(Debug)]
 enum CoinSelectionStrategy {
     FIFO,
     SpendAll,
@@ -220,7 +223,11 @@ impl SimulationBuilder {
             peer_graph: self.create_fully_connected_peer_graph(),
             wallet_data: Vec::new(),
             payment_data: Vec::new(),
-            address_data: Vec::new(),
+            address_data: vec![AddressData {
+                // First address is the "miner" address
+                wallet_id: WalletId(0),
+                script_type: ScriptType::P2tr,
+            }],
             tx_data: Vec::new(),
             broadcast_set_data: Vec::new(),
             block_data: Vec::new(),
@@ -233,6 +240,7 @@ impl SimulationBuilder {
             broadcast_set_info: Vec::new(),
             messages: Vec::new(),
             bulletin_boards: Vec::new(),
+            cospend_interests: Vec::new(),
             economic_graph: EconomicGraph::new(3, economic_graph_prng),
             config: SimulationConfig {
                 num_wallets: self.total_wallets(),
@@ -336,6 +344,9 @@ pub struct Simulation {
     /// Broadcast bulletin boards
     bulletin_boards: Vec<BulletinBoardData>,
 
+    /// Pending cospend interests from takers (non-committal proposals)
+    pub(crate) cospend_interests: Vec<CospendInterest>,
+
     // secondary information (indexes)
     /// Map of outpoints to the set of (txid, input index) pairs that spend them
     spends: OrdMap<Outpoint, OrdSet<InputId>>,
@@ -410,8 +421,7 @@ impl<'a> Simulation {
     }
 
     fn miner_address(&mut self) -> AddressId {
-        let miner = self.wallet_data[0].id;
-        miner.with_mut(self).new_address()
+        AddressId(0)
     }
 
     fn create_bulletin_board(&mut self) -> BulletinBoardId {
@@ -522,6 +532,7 @@ impl<'a> Simulation {
             handled_payment_obligations: OrdSet::<PaymentObligationId>::default(),
             active_multi_party_payjoins:
                 im::HashMap::<BulletinBoardId, MultiPartyPayjoinSession>::default(),
+            registered_inputs: OrdSet::<Outpoint>::default(),
         });
 
         let id = WalletId(self.wallet_data.len());
@@ -588,6 +599,27 @@ impl<'a> Simulation {
         // TODO BroadcastSetHandle
         let bx_id = BroadcastSetId(self.broadcast_set_data.len() - 1);
         bx_id.with_mut(self).broadcast(txs)
+    }
+
+    pub(crate) fn get_orderbook_utxos(&'a self) -> Vec<UtxoWithMetadata> {
+        self.wallet_data
+            .iter()
+            .flat_map(|wallet| {
+                let info = &self.wallet_info[wallet.last_wallet_info_id.0];
+                info.registered_inputs
+                    .iter()
+                    .filter(|outpoint| {
+                        info.confirmed_utxos.contains(outpoint)
+                            && !info.unconfirmed_spends.contains(outpoint)
+                    })
+                    .map(|outpoint| UtxoWithMetadata {
+                        outpoint: *outpoint,
+                        amount: outpoint.with(self).data().amount,
+                        owner: wallet.id,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     // FIXME debug only code?
@@ -1093,7 +1125,10 @@ mod tests {
             .with_mut(&mut sim)
             .new_tx(|tx, sim| {
                 // TODO use select_coins
-                let (inputs, drain) = alice.with(&sim).select_coins(target, long_term_feerate);
+                let (inputs, drain) =
+                    alice
+                        .with(&sim)
+                        .select_coins(target, long_term_feerate, false, None);
 
                 tx.inputs = inputs
                     .map(|o| Input {

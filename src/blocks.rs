@@ -194,6 +194,7 @@ impl<'a> BroadcastSetHandleMut<'a> {
                             info.confirmed_utxos.remove(&input.data().outpoint);
                             info.unconfirmed_txos.remove(&input.data().outpoint);
                             info.unconfirmed_spends.remove(&input.data().outpoint);
+                            info.registered_inputs.remove(&input.data().outpoint);
                             info.unconfirmed_transactions.remove(tx);
 
                             // First check if this transaction directly handles a payment obligation
@@ -203,6 +204,19 @@ impl<'a> BroadcastSetHandleMut<'a> {
                             {
                                 info.handled_payment_obligations
                                     .extend(payment_obligation_ids.iter().map(|id| *id));
+
+                                for (_, mppj_session) in info.active_multi_party_payjoins.iter() {
+                                    if mppj_session
+                                        .inputs
+                                        .iter()
+                                        .any(|i| i.outpoint == input.data().outpoint)
+                                    {
+                                        info.handled_payment_obligations.extend(
+                                            mppj_session.payment_obligation_ids.iter().copied(),
+                                        );
+                                        break;
+                                    }
+                                }
                             }
                         })
                     }

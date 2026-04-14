@@ -1,13 +1,15 @@
-use std::{collections::HashSet, iter::Sum, ops::Add};
+use std::{iter::Sum, ops::Add};
 
 use log::debug;
 
 use crate::{
     bulletin_board::BulletinBoardId,
+    cospend::{CospendInterest, UtxoWithMetadata},
     message::MessageId,
-    transaction::TxId,
-    wallet::{PaymentObligationData, PaymentObligationId, WalletHandleMut, WalletId},
-    Simulation, TimeStep,
+    transaction::Outpoint,
+    tx_contruction::TxConstructionState,
+    wallet::{PaymentObligationData, PaymentObligationId, WalletHandleMut},
+    CoinSelectionStrategy, Simulation, TimeStep,
 };
 
 fn piecewise_linear(x: f64, points: &[(f64, f64)]) -> f64 {
@@ -41,96 +43,75 @@ fn piecewise_linear(x: f64, points: &[(f64, f64)]) -> f64 {
 #[derive(Debug)]
 pub(crate) enum Action {
     /// Spend a payment obligation unilaterally
-    UnilateralSpend(PaymentObligationId),
-    /// Batch spend multiple payment obligations
-    BatchSpend(Vec<PaymentObligationId>),
-    /// Pay a payment obligation while consolidating all UTXOs into change
-    ConsolidateSelf(PaymentObligationId),
-    InitiateMultiPartyPayjoin(Vec<PaymentObligationId>),
-    /// Participate in Multiparty payjoin
-    ParticipateMultiPartyPayjoin((MessageId, BulletinBoardId, PaymentObligationId)),
+    UnilateralPayments(Vec<PaymentObligationId>, CoinSelectionStrategy),
+    /// Accept a cospend invitation
+    AcceptCospendProposal((MessageId, BulletinBoardId)),
+    /// Contribute outputs to a cospend session that is waiting for them
+    ContributeOutputsToSession(BulletinBoardId, Vec<PaymentObligationId>),
     /// Continue to participate in a multi-party payjoin
-    ContinueParticipateMultiPartyPayjoin(BulletinBoardId),
-    /// Do nothing. There may be better opportunities to spend a payment obligation or participate in a multi-party payjoin.
+    ContinueParticipateInCospend(BulletinBoardId),
+    /// Taker records non-committal interest in cospending with each orderbook UTXO
+    ProposeCospend(Vec<CospendInterest>),
+    /// Aggregator creates an aggregate session from pending interests
+    CreateAggregateProposal(Vec<CospendInterest>),
+    /// Register a single UTXO in the order book (maker action)
+    RegisterInput(Vec<Outpoint>),
+    /// Do nothing. There may be better oppurtunities to spend a payment obligation or participate in a payjoin.
     Wait,
 }
 
-/// Hypothetical outcomes of an action
-#[derive(Debug)]
-pub(crate) enum PredictedOutcome {
-    PaymentObligationsHandled(Vec<PaymentObligationHandledOutcome>),
-    InitiateMultiPartyPayjoin(InitiateMultiPartyPayjoinOutcome),
-    ParticipateMultiPartyPayjoin(ParticipateMultiPartyPayjoinOutcome),
-    Consolidation(ConsolidationOutcome),
+/// Predicted diff of wallet state resulting from taking an action.
+/// Each field corresponds to one category of state change.
+#[derive(Debug, Default)]
+pub(crate) struct PredictedOutcome {
+    /// Payment obligations fulfilled by this action
+    pub(crate) payment_obligations_handled: Vec<PaymentObligationId>,
+    /// Payment obligations missed/abandoned
+    pub(crate) payment_obligations_abandoned: Vec<PaymentObligationId>,
+    /// UTXOs consumed as inputs
+    pub(crate) utxos_spent: Vec<Outpoint>,
+    /// Outpoints of outputs created. TODO: and what feerate interval they were created in?
+    pub(crate) outputs_created: Vec<Outpoint>,
+    /// UTXOs newly published on the order book
+    pub(crate) order_book_registrations: Vec<Outpoint>,
+    /// New multi-party cospend sessions added for this wallet
+    pub(crate) cospend_proposals_accepted: Vec<BulletinBoardId>,
+    /// Session state machine transitions
+    pub(crate) session_state_updates: Vec<(BulletinBoardId, TxConstructionState)>,
 }
 
-#[derive(Debug)]
-pub(crate) struct PaymentObligationHandledOutcome {
-    /// Base cost: fee_paid + amount handled. In sats
-    base_cost: f64,
-    /// Time left on the payment obligation
-    time_left: i32,
-}
-
-impl PaymentObligationHandledOutcome {
-    fn cost(&self, payment_obligation_weight: f64) -> ActionCost {
-        let points = [
-            (0.0, 2.0 * payment_obligation_weight),
-            (2.0, payment_obligation_weight),
-            (5.0, 0.0), // There may be other oppurtunities if waited a longer
-        ];
-        let utility = piecewise_linear(self.time_left as f64, &points); // Also in denominated in sats.
-        let cost = self.base_cost - utility;
-        debug!("PaymentObligationHandledEvent cost: {:?}", cost);
-        ActionCost(cost)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct InitiateMultiPartyPayjoinOutcome {
-    /// Time left on the payment obligation
-    time_left: i32,
-    /// Base cost: fee_paid + amount handled. In sats
-    base_cost: f64,
-    /// Upper bound on the number of participants in the multi-party payjoin
-    max_participants: u32,
-}
-
-impl InitiateMultiPartyPayjoinOutcome {
-    fn cost(&self) -> ActionCost {
-        // TODO: take into account the number of participants and their inputs.
-        // For now this costs nothing as testing scaffolding.
-        ActionCost(0.0)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ParticipateMultiPartyPayjoinOutcome {
-    /// Time left on the payment obligation
-    time_left: i32,
-    /// Base cost: fee_paid + amount handled. In sats
-    base_cost: f64,
-}
-
-impl ParticipateMultiPartyPayjoinOutcome {
-    fn cost(&self) -> ActionCost {
-        // TODO: model the participation utility as a linear function of the progression of the session
-        // For now this costs nothing as testing scaffolding.
-        ActionCost(0.0)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ConsolidationOutcome {
-    /// Base cost: fee_paid in sats.
-    #[allow(dead_code)]
-    base_cost: f64,
-}
-
-impl ConsolidationOutcome {
-    fn cost(&self) -> ActionCost {
-        debug!("ConsolidationEvent cost: 0");
-        ActionCost(0.0)
+impl PredictedOutcome {
+    pub(crate) fn cost(
+        &self,
+        scorer: &CompositeScorer,
+        sim: &Simulation,
+        current_timestep: TimeStep,
+    ) -> ActionCost {
+        let mut cost = ActionCost(INHERENT_ACTION_COST);
+        for po_id in &self.payment_obligations_handled {
+            let po = po_id.with(sim).data();
+            let time_left = po.deadline.0 as i32 - current_timestep.0 as i32;
+            // Utility of 2*weight at deadline easily
+            // exceeds the base cost, making near-deadline payments cheaper than waiting.
+            let base_cost = po.amount.to_float_in(bitcoin::Denomination::Bitcoin);
+            let points = [
+                (0.0, 2.0 * scorer.payment_obligation_weight),
+                (2.0, scorer.payment_obligation_weight),
+                (5.0, 0.0),
+            ];
+            let utility = piecewise_linear(time_left as f64, &points);
+            debug!(
+                "PaymentObligationHandled cost: base={} utility={}",
+                base_cost, utility
+            );
+            cost = cost + ActionCost(base_cost - utility);
+        }
+        // TODO: cost from payment_obligations_abandoned (missed deadline penalty)
+        // TODO: cost from utxos_spent (UTXO fragmentation / privacy loss)
+        // TODO: cost from outputs_created (fee rate efficiency)
+        // TODO: cost from order_book_registrations (coordination value)
+        // TODO: cost from cospend_proposals_accepted / session_state_updates (privacy gain)
+        cost
     }
 }
 
@@ -138,135 +119,121 @@ impl ConsolidationOutcome {
 #[derive(Debug)]
 pub(crate) struct WalletView {
     payment_obligations: Vec<PaymentObligationData>,
-    active_multi_party_payjoins: Vec<BulletinBoardId>,
-    new_multi_party_payjoins: Vec<(BulletinBoardId, MessageId)>,
-    current_timestep: TimeStep,
-    wallet_id: WalletId,
-    // TODO: utxos, feerate, cospend oppurtunities, etc.
+    active_cospends: Vec<BulletinBoardId>,
+    cospend_proposals: Vec<(BulletinBoardId, MessageId)>,
+    utxos: Vec<UtxoWithMetadata>,
+    registered_inputs: Vec<Outpoint>,
+    /// UTXOs currently registered on the order book (for taker to propose to)
+    orderbook_utxos: Vec<UtxoWithMetadata>,
+    /// Pending cospend interests (for aggregator to batch into sessions)
+    pending_interests: Vec<CospendInterest>,
 }
 
 impl WalletView {
     pub(crate) fn new(
         payment_obligations: Vec<PaymentObligationData>,
-        new_multi_party_payjoins: Vec<(BulletinBoardId, MessageId)>,
-        active_multi_party_payjoins: Vec<BulletinBoardId>,
-        current_timestep: TimeStep,
-        wallet_id: WalletId,
+        cospend_proposals: Vec<(BulletinBoardId, MessageId)>,
+        active_cospends: Vec<BulletinBoardId>,
+        utxos: Vec<UtxoWithMetadata>,
+        registered_inputs: Vec<Outpoint>,
+        orderbook_utxos: Vec<UtxoWithMetadata>,
+        pending_interests: Vec<CospendInterest>,
     ) -> Self {
         Self {
             payment_obligations,
-            active_multi_party_payjoins,
-            new_multi_party_payjoins,
-            current_timestep,
-            wallet_id,
+            active_cospends,
+            cospend_proposals,
+            utxos,
+            registered_inputs,
+            orderbook_utxos,
+            pending_interests,
         }
     }
 }
-fn get_payment_obligation_handled_outcome(
-    payment_obligation_id: &PaymentObligationId,
-    sim: &Simulation,
-    current_timestep: TimeStep,
-    fee_paid: f64,
-) -> PaymentObligationHandledOutcome {
-    let payment_obligation = payment_obligation_id.with(&sim).data();
-    let deadline = payment_obligation.deadline;
-    PaymentObligationHandledOutcome {
-        base_cost: fee_paid
-            + payment_obligation
-                .amount
-                .to_float_in(bitcoin::Denomination::Satoshi),
-        time_left: deadline.0 as i32 - current_timestep.0 as i32,
-    }
-}
-
-fn simulate_one_action(wallet_handle: &WalletHandleMut, action: &Action) -> Vec<PredictedOutcome> {
-    let wallet_view = wallet_handle.wallet_view();
-    let mut events = vec![];
+fn simulate_one_action(wallet_handle: &WalletHandleMut, action: &Action) -> PredictedOutcome {
     let old_info = wallet_handle.info().clone();
 
-    // Deep clone the simulation and run the action
     let wallet_id = wallet_handle.data().id;
     let mut sim = wallet_handle.sim.clone();
-    let mut new_wallet_handle = wallet_handle.data().id.with_mut(&mut sim);
-    new_wallet_handle.do_action(action);
-    let new_wallet_handle = wallet_id.with(&sim);
-    let new_info = new_wallet_handle.info();
-    let fee_paid_total = action_fee_paid_sats(&old_info, new_info, &sim);
+    wallet_id.with_mut(&mut sim).do_action(action);
+    let new_info = wallet_id.with(&sim).info().clone();
 
-    if let Action::UnilateralSpend(payment_obligation_id) = action {
-        let payment_obligation = payment_obligation_id.with(&sim).data();
-        let deadline = payment_obligation.deadline;
-        events.push(PredictedOutcome::PaymentObligationsHandled(vec![
-            PaymentObligationHandledOutcome {
-                base_cost: fee_paid_total
-                    + payment_obligation
-                        .amount
-                        .to_float_in(bitcoin::Denomination::Satoshi),
-                time_left: deadline.0 as i32 - wallet_view.current_timestep.0 as i32,
-            },
-        ]));
-    }
+    // POs handled: derived from action since confirmation is deferred to block
+    let payment_obligations_handled: Vec<PaymentObligationId> = match action {
+        Action::UnilateralPayments(po_ids, _) => po_ids.clone(),
+        Action::ContributeOutputsToSession(_, po_ids) => po_ids.clone(),
+        _ => vec![],
+    };
 
-    if let Action::BatchSpend(payment_obligation_ids) = action {
-        let mut outcomes = vec![];
-        let total_amount_handled: f64 = payment_obligation_ids
-            .iter()
-            .map(|payment_obligation_id| {
-                payment_obligation_id
-                    .with(&sim)
-                    .data()
-                    .amount
-                    .to_float_in(bitcoin::Denomination::Satoshi)
-            })
-            .sum();
-        for payment_obligation_id in payment_obligation_ids.iter() {
-            let amount_handled = payment_obligation_id
-                .with(&sim)
-                .data()
-                .amount
-                .to_float_in(bitcoin::Denomination::Satoshi);
-            let fee_paid = if total_amount_handled > 0.0 {
-                fee_paid_total * (amount_handled / total_amount_handled)
-            } else {
-                0.0
-            };
-            outcomes.push(get_payment_obligation_handled_outcome(
-                payment_obligation_id,
-                &sim,
-                wallet_view.current_timestep,
-                fee_paid,
-            ));
-        }
-        events.push(PredictedOutcome::PaymentObligationsHandled(outcomes));
-    }
-
-    if matches!(action, Action::ConsolidateSelf(_)) {
-        events.push(PredictedOutcome::Consolidation(ConsolidationOutcome {
-            base_cost: fee_paid_total,
-        }));
-    }
-
-    events
-}
-
-fn action_fee_paid_sats(
-    old_info: &crate::wallet::WalletInfo,
-    new_info: &crate::wallet::WalletInfo,
-    sim: &Simulation,
-) -> f64 {
-    let old_txs: HashSet<TxId> = old_info.broadcast_transactions.iter().copied().collect();
-    new_info
-        .broadcast_transactions
+    // UTXOs spent: new entries in unconfirmed_spends
+    let utxos_spent: Vec<Outpoint> = new_info
+        .unconfirmed_spends
         .iter()
-        .filter(|txid| !old_txs.contains(txid))
-        .map(|txid| txid.with(sim).info().fee.to_sat() as f64)
-        .sum()
+        .filter(|op| !old_info.unconfirmed_spends.contains(op))
+        .copied()
+        .collect();
+
+    // Outputs created: new entries in unconfirmed_txos
+    let outputs_created: Vec<Outpoint> = new_info
+        .unconfirmed_txos
+        .iter()
+        .filter(|op| !old_info.unconfirmed_txos.contains(op))
+        .copied()
+        .collect();
+
+    // Order book registrations: new entries in registered_inputs
+    let order_book_registrations: Vec<Outpoint> = new_info
+        .registered_inputs
+        .iter()
+        .filter(|op| !old_info.registered_inputs.contains(op))
+        .copied()
+        .collect();
+
+    // Cospend proposals accepted: new sessions where this wallet is a maker
+    let cospend_proposals_accepted: Vec<BulletinBoardId> = new_info
+        .active_multi_party_payjoins
+        .iter()
+        .filter(|(bb, _session)| !old_info.active_multi_party_payjoins.contains_key(bb))
+        .map(|(bb, _)| *bb)
+        .collect();
+
+    // Session state transitions: boards present in both old and new with a different state
+    let session_state_updates: Vec<(BulletinBoardId, TxConstructionState)> = new_info
+        .active_multi_party_payjoins
+        .iter()
+        .filter_map(|(bb, new_session)| {
+            old_info
+                .active_multi_party_payjoins
+                .get(bb)
+                .and_then(|old_session| {
+                    if old_session.state != new_session.state {
+                        Some((*bb, new_session.state.clone()))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .collect();
+
+    PredictedOutcome {
+        payment_obligations_handled,
+        payment_obligations_abandoned: vec![],
+        utxos_spent,
+        outputs_created,
+        order_book_registrations,
+        cospend_proposals_accepted,
+        session_state_updates,
+    }
 }
 
 /// Strategies will pick one action to minimize their cost
 /// TODO: Strategies should be composible. They should enform the action decision space scoring and doing actions should be handling by something else that has composed multiple strategies.
 pub(crate) trait Strategy: std::fmt::Debug {
-    fn enumerate_candidate_actions(&self, state: &WalletView) -> Vec<Action>;
+    fn enumerate_candidate_actions(
+        &self,
+        state: &WalletView,
+        wallet: &WalletHandleMut,
+    ) -> Vec<Action>;
     fn clone_box(&self) -> Box<dyn Strategy>;
 }
 
@@ -304,16 +271,21 @@ pub(crate) struct UnilateralSpender;
 
 impl Strategy for UnilateralSpender {
     /// The decision space of the unilateral spender is the set of all payment obligations
-    fn enumerate_candidate_actions(&self, state: &WalletView) -> Vec<Action> {
+    fn enumerate_candidate_actions(
+        &self,
+        state: &WalletView,
+        _wallet: &WalletHandleMut,
+    ) -> Vec<Action> {
         if state.payment_obligations.is_empty() {
             return vec![Action::Wait];
         }
         let mut actions = vec![];
         for po in state.payment_obligations.iter() {
-            // For every payment obligation, we can spend it unilaterally
-            actions.push(Action::UnilateralSpend(po.id));
+            actions.push(Action::UnilateralPayments(
+                vec![po.id],
+                CoinSelectionStrategy::BNB,
+            ));
         }
-
         actions
     }
 
@@ -326,11 +298,19 @@ impl Strategy for UnilateralSpender {
 pub(crate) struct Consolidator;
 
 impl Strategy for Consolidator {
-    fn enumerate_candidate_actions(&self, state: &WalletView) -> Vec<Action> {
+    /// Always uses SpendAll when paying.
+    /// trade-off. Fee savings from reducing UTXO fragmentation are captured when fee_savings_weight > 0.
+    fn enumerate_candidate_actions(
+        &self,
+        state: &WalletView,
+        _wallet: &WalletHandleMut,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         for po in state.payment_obligations.iter() {
-            actions.push(Action::UnilateralSpend(po.id));
-            actions.push(Action::ConsolidateSelf(po.id));
+            actions.push(Action::UnilateralPayments(
+                vec![po.id],
+                CoinSelectionStrategy::SpendAll,
+            ));
         }
         actions.push(Action::Wait);
         actions
@@ -345,17 +325,21 @@ impl Strategy for Consolidator {
 pub(crate) struct BatchSpender;
 
 impl Strategy for BatchSpender {
-    fn enumerate_candidate_actions(&self, state: &WalletView) -> Vec<Action> {
+    fn enumerate_candidate_actions(
+        &self,
+        state: &WalletView,
+        _wallet: &WalletHandleMut,
+    ) -> Vec<Action> {
         if state.payment_obligations.is_empty() {
             return vec![Action::Wait];
         }
-        // TODO: we may need to consider differnt partitioning strategies for the batch spend
-        // Maybe some partitions have higher utility if batched than others that have longer deadlines
-        let mut payment_obligation_ids: Vec<PaymentObligationId> = vec![];
-        for po in state.payment_obligations.iter() {
-            payment_obligation_ids.push(po.id);
-        }
-        vec![Action::BatchSpend(payment_obligation_ids)]
+        // TODO: we may need to consider different partitioning strategies for the batch spend
+        let payment_obligation_ids: Vec<PaymentObligationId> =
+            state.payment_obligations.iter().map(|po| po.id).collect();
+        vec![Action::UnilateralPayments(
+            payment_obligation_ids,
+            CoinSelectionStrategy::BNB,
+        )]
     }
 
     fn clone_box(&self) -> Box<dyn Strategy> {
@@ -364,85 +348,168 @@ impl Strategy for BatchSpender {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct MultipartyPayjoinInitiatorStrategy;
+pub(crate) struct MakerStrategy;
 
-impl Strategy for MultipartyPayjoinInitiatorStrategy {
-    fn enumerate_candidate_actions(&self, state: &WalletView) -> Vec<Action> {
-        if state.payment_obligations.is_empty() {
-            return vec![Action::Wait];
-        }
-        // TODO: if the sesion is on going do not intiate a new one
-        // TODO: this is scaffolding for now, peers in the future will evaluate if they should initiate a multi-party payjoin given the number of payment obligations
-        if state.wallet_id != WalletId(0) {
-            return vec![Action::Wait];
-        }
-        let receivers = state
-            .payment_obligations
-            .iter()
-            .map(|po| po.to)
-            .collect::<HashSet<_>>();
-        if receivers.len() < 2 {
-            return vec![Action::Wait];
-        }
-
-        // TODO: only one multi-party payjoin session can be active at a time FOR NOW
+impl Strategy for MakerStrategy {
+    fn enumerate_candidate_actions(
+        &self,
+        state: &WalletView,
+        wallet: &WalletHandleMut,
+    ) -> Vec<Action> {
         let mut actions = vec![];
-        if !state.active_multi_party_payjoins.is_empty() {
-            // If we have an active session we should actively participate in it
-            debug_assert!(state.active_multi_party_payjoins.len() <= 1);
-            for bulletin_board_id in state.active_multi_party_payjoins.iter() {
-                actions.push(Action::ContinueParticipateMultiPartyPayjoin(
+
+        // Continue to participate in active sessions
+        for bulletin_board_id in state.active_cospends.iter() {
+            actions.push(Action::ContinueParticipateInCospend(*bulletin_board_id));
+        }
+
+        // Accept new invitations. TODO: in the future makers will be have certain preferences for which invitations to accept.
+        if let Some((bulletin_board_id, message_id)) = state.cospend_proposals.iter().next() {
+            if state.active_cospends.is_empty() {
+                actions.push(Action::AcceptCospendProposal((
+                    *message_id,
                     *bulletin_board_id,
-                ));
+                )));
             }
-            return actions;
         }
 
-        actions.push(Action::InitiateMultiPartyPayjoin(
-            state.payment_obligations.iter().map(|po| po.id).collect(),
-        ));
-
-        actions
-    }
-
-    fn clone_box(&self) -> Box<dyn Strategy> {
-        Box::new(self.clone())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct MultipartyPayjoinParticipantStrategy;
-
-impl Strategy for MultipartyPayjoinParticipantStrategy {
-    fn enumerate_candidate_actions(&self, state: &WalletView) -> Vec<Action> {
-        if state.payment_obligations.is_empty() {
-            return vec![Action::Wait];
-        }
-
-        let mut actions = vec![];
-        //TODO: Only one multi-party payjoin session can be initiated at a time FOR NOW
-
-        if let Some((bulletin_board_id, message_id)) = state.new_multi_party_payjoins.iter().next()
-        {
-            // TODO participate in one session at a time
-            if state.active_multi_party_payjoins.is_empty() {
+        // Contribute outputs to sessions that are waiting for them (SentInputs state)
+        for (bb_id, session) in wallet.info().active_multi_party_payjoins.iter() {
+            if session.state == TxConstructionState::AcceptedProposal {
                 for po in state.payment_obligations.iter() {
-                    actions.push(Action::ParticipateMultiPartyPayjoin((
-                        *message_id,
-                        *bulletin_board_id,
-                        po.id,
-                    )));
+                    actions.push(Action::ContributeOutputsToSession(*bb_id, vec![po.id]));
                 }
             }
         }
 
-        // Or continue to participate in the existing session
-        for bulletin_board_id in state.active_multi_party_payjoins.iter() {
-            actions.push(Action::ContinueParticipateMultiPartyPayjoin(
-                *bulletin_board_id,
-            ));
+        // Only figure out what to register when truly idle: no pending invitations, no active
+        // sessions (except completed ones). The wallet's session map is the authoritative source.
+        let has_active_sessions = !state.active_cospends.is_empty()
+            || wallet
+                .info()
+                .active_multi_party_payjoins
+                .values()
+                .any(|s| !matches!(s.state, TxConstructionState::Success(_)));
+        let unilateral_actions = if state.cospend_proposals.is_empty() && !has_active_sessions {
+            UnilateralSpender.enumerate_candidate_actions(state, wallet)
+        } else {
+            vec![]
+        };
+        let per_action_spent: Vec<std::collections::HashSet<Outpoint>> = unilateral_actions
+            .iter()
+            .filter(|a| matches!(a, Action::UnilateralPayments(_, _)))
+            .map(|action| {
+                simulate_one_action(wallet, action)
+                    .utxos_spent
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        let common_inputs: Vec<Outpoint> = per_action_spent
+            .iter()
+            .skip(1)
+            .fold(
+                per_action_spent.first().cloned().unwrap_or_default(),
+                |acc, s| acc.intersection(s).copied().collect(),
+            )
+            .iter()
+            .filter(|o| !state.registered_inputs.contains(o))
+            .copied()
+            .collect();
+        if !common_inputs.is_empty() {
+            actions.push(Action::RegisterInput(common_inputs));
+        }
+        if actions.is_empty() {
+            actions.push(Action::Wait);
         }
         actions
+    }
+
+    fn clone_box(&self) -> Box<dyn Strategy> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TakerStrategy;
+
+impl Strategy for TakerStrategy {
+    fn enumerate_candidate_actions(
+        &self,
+        state: &WalletView,
+        wallet: &WalletHandleMut,
+    ) -> Vec<Action> {
+        let mut actions = vec![];
+
+        // Contribute outputs to sessions awaiting them (SentInputs state)
+        for (bb_id, session) in wallet.info().active_multi_party_payjoins.iter() {
+            if session.state == TxConstructionState::AcceptedProposal {
+                for po in state.payment_obligations.iter() {
+                    actions.push(Action::ContributeOutputsToSession(*bb_id, vec![po.id]));
+                }
+            }
+        }
+
+        // Continue active sessions in later states
+        for bulletin_board_id in state.active_cospends.iter() {
+            actions.push(Action::ContinueParticipateInCospend(*bulletin_board_id));
+        }
+
+        if !actions.is_empty() {
+            return actions;
+        }
+
+        // Accept any pending invitations from the aggregator before proposing new ones.
+        if let Some((bulletin_board_id, message_id)) = state.cospend_proposals.iter().next() {
+            return vec![Action::AcceptCospendProposal((
+                *message_id,
+                *bulletin_board_id,
+            ))];
+        }
+
+        if state.payment_obligations.is_empty() {
+            return vec![Action::Wait];
+        }
+
+        // Propose to each orderbook UTXO (non-committal): one interest per peer coin.
+        let own_utxo = match state.utxos.first() {
+            Some(u) => u.clone(),
+            None => return vec![Action::Wait],
+        };
+        let interests: Vec<CospendInterest> = state
+            .orderbook_utxos
+            .iter()
+            .map(|peer_utxo| CospendInterest {
+                utxos: vec![own_utxo.clone(), peer_utxo.clone()],
+            })
+            .collect();
+
+        if interests.is_empty() {
+            return vec![Action::Wait];
+        }
+        vec![Action::ProposeCospend(interests)]
+    }
+
+    fn clone_box(&self) -> Box<dyn Strategy> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AggregatorStrategy;
+
+impl Strategy for AggregatorStrategy {
+    fn enumerate_candidate_actions(
+        &self,
+        state: &WalletView,
+        _wallet: &WalletHandleMut,
+    ) -> Vec<Action> {
+        if state.pending_interests.is_empty() {
+            return vec![Action::Wait];
+        }
+        vec![Action::CreateAggregateProposal(
+            state.pending_interests.clone(),
+        )]
     }
 
     fn clone_box(&self) -> Box<dyn Strategy> {
@@ -456,10 +523,14 @@ pub(crate) struct CompositeStrategy {
 }
 
 impl Strategy for CompositeStrategy {
-    fn enumerate_candidate_actions(&self, state: &WalletView) -> Vec<Action> {
+    fn enumerate_candidate_actions(
+        &self,
+        state: &WalletView,
+        wallet: &WalletHandleMut,
+    ) -> Vec<Action> {
         let mut actions = vec![];
         for strategy in self.strategies.iter() {
-            actions.extend(strategy.enumerate_candidate_actions(state));
+            actions.extend(strategy.enumerate_candidate_actions(state, wallet));
         }
         actions
     }
@@ -494,29 +565,9 @@ impl CompositeScorer {
         action: &Action,
         wallet_handle: &WalletHandleMut,
     ) -> ActionCost {
-        let events = simulate_one_action(wallet_handle, action);
-        // For now each action should only result in one event or none if we are waiting
-        debug_assert!(events.len() <= 1);
-        let mut cost = ActionCost(INHERENT_ACTION_COST);
-        for event in events {
-            match event {
-                PredictedOutcome::PaymentObligationsHandled(outcomes) => {
-                    for outcome in outcomes.iter() {
-                        cost = cost + outcome.cost(self.payment_obligation_weight);
-                    }
-                }
-                PredictedOutcome::InitiateMultiPartyPayjoin(event) => {
-                    cost = cost + event.cost();
-                }
-                PredictedOutcome::ParticipateMultiPartyPayjoin(event) => {
-                    cost = cost + event.cost();
-                }
-                PredictedOutcome::Consolidation(event) => {
-                    cost = cost + event.cost();
-                }
-            }
-        }
-        cost
+        let current_timestep = wallet_handle.sim.current_timestep;
+        let outcome = simulate_one_action(wallet_handle, action);
+        outcome.cost(self, wallet_handle.sim, current_timestep)
     }
 }
 
@@ -526,10 +577,9 @@ pub(crate) fn create_strategy(name: &str) -> Result<Box<dyn Strategy>, String> {
         "UnilateralSpender" => Ok(Box::new(UnilateralSpender)),
         "Consolidator" => Ok(Box::new(Consolidator)),
         "BatchSpender" => Ok(Box::new(BatchSpender)),
-        "MultipartyPayjoinInitiatorStrategy" => Ok(Box::new(MultipartyPayjoinInitiatorStrategy)),
-        "MultipartyPayjoinParticipantStrategy" => {
-            Ok(Box::new(MultipartyPayjoinParticipantStrategy))
-        }
+        "TakerStrategy" => Ok(Box::new(TakerStrategy)),
+        "MakerStrategy" => Ok(Box::new(MakerStrategy)),
+        "AggregatorStrategy" => Ok(Box::new(AggregatorStrategy)),
         _ => Err(format!("Unknown strategy: {}", name)),
     }
 }
@@ -537,7 +587,10 @@ pub(crate) fn create_strategy(name: &str) -> Result<Box<dyn Strategy>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{wallet::PaymentObligationData, TimeStep};
+    use crate::{
+        wallet::{PaymentObligationData, WalletId},
+        TimeStep,
+    };
     use bitcoin::Amount;
 
     fn create_test_wallet_view(payment_obligations: Vec<PaymentObligationData>) -> WalletView {
@@ -545,13 +598,44 @@ mod tests {
             payment_obligations,
             vec![],
             vec![],
-            TimeStep(0),
-            WalletId(0),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
         )
+    }
+
+    fn test_sim() -> crate::Simulation {
+        use crate::{
+            config::{ScorerConfig, WalletTypeConfig},
+            script_type::ScriptType,
+            SimulationBuilder,
+        };
+        SimulationBuilder::new(
+            42,
+            vec![WalletTypeConfig {
+                name: "test".to_string(),
+                count: 2,
+                strategies: vec!["UnilateralSpender".to_string()],
+                scorer: ScorerConfig {
+                    fee_savings_weight: 0.0,
+                    privacy_weight: 0.0,
+                    payment_obligation_weight: 0.0,
+                    coordination_weight: 0.0,
+                },
+                script_type: ScriptType::P2tr,
+            }],
+            10,
+            1,
+            0,
+        )
+        .build()
     }
 
     #[test]
     fn test_unilateral_spender() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
         let strategy = UnilateralSpender;
         let po = PaymentObligationData {
             id: PaymentObligationId(0),
@@ -563,16 +647,18 @@ mod tests {
         };
         let view = create_test_wallet_view(vec![po]);
 
-        let actions = strategy.enumerate_candidate_actions(&view);
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
 
         assert_eq!(actions.len(), 1);
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::UnilateralSpend(_))));
+            .any(|a| matches!(a, Action::UnilateralPayments(ids, CoinSelectionStrategy::BNB) if ids.len() == 1)));
     }
 
     #[test]
     fn test_unilateral_consolidate_spender() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
         let strategy = Consolidator;
         let po = PaymentObligationData {
             id: PaymentObligationId(0),
@@ -582,21 +668,24 @@ mod tests {
             from: WalletId(0),
             to: WalletId(1),
         };
-        let view = WalletView::new(vec![po], vec![], vec![], TimeStep(0), WalletId(0));
+        let view = WalletView::new(vec![po], vec![], vec![], vec![], vec![], vec![], vec![]);
 
-        let actions = strategy.enumerate_candidate_actions(&view);
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
 
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::ConsolidateSelf(_))));
         assert!(actions.iter().any(|a| matches!(a, Action::Wait)));
+        // Consolidator always uses SpendAll (strategy commitment, not cost trade-off)
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::UnilateralSpend(_))));
+            .any(|a| matches!(a, Action::UnilateralPayments(ids, CoinSelectionStrategy::SpendAll) if ids.len() == 1)));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::UnilateralPayments(_, CoinSelectionStrategy::BNB))));
     }
 
     #[test]
     fn test_batch_spender_creates_batches() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
         let strategy = BatchSpender;
         let po1 = PaymentObligationData {
             id: PaymentObligationId(0),
@@ -616,17 +705,19 @@ mod tests {
         };
         let view = create_test_wallet_view(vec![po1, po2]);
 
-        let actions = strategy.enumerate_candidate_actions(&view);
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
 
         // BatchSpender creates a single batch with all obligations
         assert_eq!(actions.len(), 1);
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::BatchSpend(ids) if ids.len() == 2)));
+            .any(|a| matches!(a, Action::UnilateralPayments(ids, _) if ids.len() == 2)));
     }
 
     #[test]
     fn test_composite_strategy_combines_actions() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
         let composite = CompositeStrategy {
             strategies: vec![Box::new(UnilateralSpender), Box::new(BatchSpender)],
         };
@@ -649,112 +740,136 @@ mod tests {
         };
         let view = create_test_wallet_view(vec![po1, po2]);
 
-        let actions = composite.enumerate_candidate_actions(&view);
+        let actions = composite.enumerate_candidate_actions(&view, &wallet);
 
         // Should include actions from both strategies
-        // UnilateralSpender: 2 actions (one per obligation)
-        // BatchSpender: 1 action (batch of both)
+        // UnilateralSpender: 2 actions (one per obligation, single-PO each)
+        // BatchSpender: 1 action (all obligations in one tx)
         assert_eq!(actions.len(), 3);
 
-        let unilateral_count = actions
+        let single_po_count = actions
             .iter()
-            .filter(|a| matches!(a, Action::UnilateralSpend(_)))
+            .filter(|a| matches!(a, Action::UnilateralPayments(ids, CoinSelectionStrategy::BNB) if ids.len() == 1))
             .count();
-        assert_eq!(unilateral_count, 2);
+        assert_eq!(single_po_count, 2);
 
         let batch_count = actions
             .iter()
-            .filter(|a| matches!(a, Action::BatchSpend(_)))
+            .filter(|a| matches!(a, Action::UnilateralPayments(ids, _) if ids.len() == 2))
             .count();
         assert_eq!(batch_count, 1);
     }
 
     #[test]
-    fn test_multiparty_initiator_with_insufficient_receivers() {
-        let strategy = MultipartyPayjoinInitiatorStrategy;
-
-        // Only 1 unique receiver - not enough for multi-party
-        let po1 = PaymentObligationData {
-            id: PaymentObligationId(0),
-            deadline: TimeStep(100),
-            reveal_time: TimeStep(0),
-            amount: Amount::from_sat(1000),
-            from: WalletId(0),
-            to: WalletId(1), // Same receiver
-        };
-        let po2 = PaymentObligationData {
-            id: PaymentObligationId(1),
-            deadline: TimeStep(100),
-            reveal_time: TimeStep(0),
-            amount: Amount::from_sat(2000),
-            from: WalletId(0),
-            to: WalletId(1), // Same receiver
-        };
-        let view = create_test_wallet_view(vec![po1, po2]);
-
-        let actions = strategy.enumerate_candidate_actions(&view);
-
-        // Should return Wait because we need at least 2 different receivers
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], Action::Wait));
-    }
-
-    #[test]
-    fn test_multiparty_initiator_with_multiple_receivers() {
-        let strategy = MultipartyPayjoinInitiatorStrategy;
-
-        // 2 different receivers - enough for multi-party
-        let po1 = PaymentObligationData {
-            id: PaymentObligationId(0),
-            deadline: TimeStep(100),
-            reveal_time: TimeStep(0),
-            amount: Amount::from_sat(1000),
-            from: WalletId(0),
-            to: WalletId(1), // Receiver 1
-        };
-        let po2 = PaymentObligationData {
-            id: PaymentObligationId(1),
-            deadline: TimeStep(100),
-            reveal_time: TimeStep(0),
-            amount: Amount::from_sat(2000),
-            from: WalletId(0),
-            to: WalletId(2), // Receiver 2 (different)
-        };
-        let view = create_test_wallet_view(vec![po1, po2]);
-
-        let actions = strategy.enumerate_candidate_actions(&view);
-
-        assert_eq!(actions.len(), 1);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::InitiateMultiPartyPayjoin(ids) if ids.len() == 2)));
-    }
-
-    #[test]
-    fn test_multiparty_initiator_only_wallet_0() {
-        let strategy = MultipartyPayjoinInitiatorStrategy;
+    fn test_taker_waits_with_no_orderbook_utxos() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
+        let strategy = TakerStrategy;
 
         let po = PaymentObligationData {
             id: PaymentObligationId(0),
             deadline: TimeStep(100),
             reveal_time: TimeStep(0),
             amount: Amount::from_sat(1000),
-            from: WalletId(1), // Not wallet 0
-            to: WalletId(2),
+            from: WalletId(0),
+            to: WalletId(1),
         };
+        // No orderbook UTXOs — taker has nothing to propose to
+        let view = create_test_wallet_view(vec![po]);
 
-        let view = WalletView::new(vec![po], vec![], vec![], TimeStep(0), WalletId(1));
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
 
-        let actions = strategy.enumerate_candidate_actions(&view);
-
-        // Should return Wait because only Wallet 0 can initiate
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], Action::Wait));
     }
 
     #[test]
-    fn test_multiparty_participant_with_new_invitation() {
-        let strategy = MultipartyPayjoinParticipantStrategy;
+    fn test_taker_proposes_cospend_with_orderbook_utxos() {
+        use crate::{cospend::UtxoWithMetadata, transaction::Outpoint, transaction::TxId};
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
+        let strategy = TakerStrategy;
+
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+        let peer_utxo = UtxoWithMetadata {
+            outpoint: Outpoint {
+                txid: TxId(99),
+                index: 0,
+            },
+            amount: Amount::from_sat(5000),
+            owner: WalletId(1),
+        };
+        let own_utxo = UtxoWithMetadata {
+            outpoint: Outpoint {
+                txid: TxId(42),
+                index: 0,
+            },
+            amount: Amount::from_sat(3000),
+            owner: WalletId(0),
+        };
+        let view = WalletView::new(
+            vec![po],
+            vec![],
+            vec![],
+            vec![own_utxo],
+            vec![],
+            vec![peer_utxo],
+            vec![],
+        );
+
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ProposeCospend(interests) if interests.len() == 1)));
+    }
+
+    #[test]
+    fn test_taker_continues_active_session() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
+        let strategy = TakerStrategy;
+
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+
+        let view = WalletView::new(
+            vec![po],
+            vec![],
+            vec![BulletinBoardId(0)], // Active session (SentOutputs or later)
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ContinueParticipateInCospend(_))));
+    }
+
+    #[test]
+    fn test_maker_with_new_invitation() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
+        let strategy = MakerStrategy;
 
         let po = PaymentObligationData {
             id: PaymentObligationId(0),
@@ -769,21 +884,70 @@ mod tests {
             vec![po],
             vec![(BulletinBoardId(0), MessageId(0))], // New invitation
             vec![],                                   // No active sessions yet
-            TimeStep(0),
-            WalletId(1),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
         );
 
-        let actions = strategy.enumerate_candidate_actions(&view);
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
 
         assert_eq!(actions.len(), 1);
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::ParticipateMultiPartyPayjoin(_))));
+            .any(|a| matches!(a, Action::AcceptCospendProposal((_, BulletinBoardId(0))))));
     }
 
     #[test]
-    fn test_multiparty_participant_with_active_session() {
-        let strategy = MultipartyPayjoinParticipantStrategy;
+    fn test_maker_contributes_outputs_when_session_awaiting() {
+        let mut sim = test_sim();
+
+        // Create a bulletin board and accept an invitation, advancing session to SentInputs
+        let bb_id = sim.create_bulletin_board();
+        let msg_id = MessageId(0);
+        WalletId(0)
+            .with_mut(&mut sim)
+            .do_action(&Action::AcceptCospendProposal((msg_id, bb_id)));
+
+        let po = PaymentObligationData {
+            id: PaymentObligationId(0),
+            deadline: TimeStep(100),
+            reveal_time: TimeStep(0),
+            amount: Amount::from_sat(1000),
+            from: WalletId(0),
+            to: WalletId(1),
+        };
+
+        let strategy = MakerStrategy;
+        let wallet = WalletId(0).with_mut(&mut sim);
+
+        // Verify the session is in SentInputs state
+        let session = wallet
+            .info()
+            .active_multi_party_payjoins
+            .get(&bb_id)
+            .unwrap();
+        assert_eq!(
+            session.state,
+            crate::tx_contruction::TxConstructionState::AcceptedProposal
+        );
+        let view = WalletView::new(vec![po], vec![], vec![], vec![], vec![], vec![], vec![]);
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ContributeOutputsToSession(id, ids) if *id == bb_id && ids.len() == 1)));
+        // Should NOT emit ContinueParticipateInCospend for this session
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ContinueParticipateInCospend(id) if *id == bb_id)));
+    }
+
+    #[test]
+    fn test_maker_with_active_session() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
+        let strategy = MakerStrategy;
 
         let po = PaymentObligationData {
             id: PaymentObligationId(0),
@@ -798,21 +962,25 @@ mod tests {
             vec![po],
             vec![],
             vec![BulletinBoardId(0)], // Active session
-            TimeStep(0),
-            WalletId(1),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
         );
 
-        let actions = strategy.enumerate_candidate_actions(&view);
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
 
         assert_eq!(actions.len(), 1);
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::ContinueParticipateMultiPartyPayjoin(_))));
+            .any(|a| matches!(a, Action::ContinueParticipateInCospend(_))));
     }
 
     #[test]
-    fn test_multiparty_participant_prefers_continue_when_invite_and_active() {
-        let strategy = MultipartyPayjoinParticipantStrategy;
+    fn test_maker_prefers_continue_when_invite_and_active() {
+        let mut sim = test_sim();
+        let wallet = WalletId(0).with_mut(&mut sim);
+        let strategy = MakerStrategy;
 
         let po = PaymentObligationData {
             id: PaymentObligationId(0),
@@ -828,16 +996,18 @@ mod tests {
             vec![po],
             vec![(BulletinBoardId(0), MessageId(0))],
             vec![BulletinBoardId(1)],
-            TimeStep(0),
-            WalletId(1),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
         );
 
-        let actions = strategy.enumerate_candidate_actions(&view);
+        let actions = strategy.enumerate_candidate_actions(&view, &wallet);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::ContinueParticipateMultiPartyPayjoin(BulletinBoardId(1))
+            Action::ContinueParticipateInCospend(BulletinBoardId(1))
         ));
     }
 }
