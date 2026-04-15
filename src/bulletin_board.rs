@@ -14,6 +14,7 @@ define_entity!(
 );
 
 impl<'a> BulletinBoardHandle<'a> {
+    #[allow(dead_code)]
     pub(crate) fn data(&self) -> &'a BulletinBoardData {
         &self.sim.bulletin_boards[self.id.0]
     }
@@ -21,6 +22,7 @@ impl<'a> BulletinBoardHandle<'a> {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum BroadcastMessageType {
+    #[allow(dead_code)]
     AcceptCoSpend(Vec<UtxoWithMetadata>),
     ContributeInputs(Outpoint),
     ContributeOutputs(Output),
